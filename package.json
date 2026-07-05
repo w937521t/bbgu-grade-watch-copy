@@ -1,0 +1,11 @@
+{
+  "name": "bbgu-grade-watch",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test bbgu_grade_watch.test.js scripts/*.test.js"
+  },
+  "dependencies": {
+    "playwright": "1.61.1"
+  }
+}

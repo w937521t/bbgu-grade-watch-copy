@@ -1,0 +1,138 @@
+name: 北部湾大学成绩监控
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 运行模式
+        required: true
+        default: watch
+        type: choice
+        options: [watch, renew, login]
+  schedule:
+    - cron: '0 10-22 * * *'
+      timezone: Asia/Shanghai
+    - cron: '30 1-23/2 * * *'
+      timezone: Asia/Shanghai
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bbgu-login-state
+  cancel-in-progress: false
+
+jobs:
+  bbgu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BBGU_DATA_DIR: ${{ github.workspace }}/bbgu-data
+      BBGU_HEADLESS: 'true'
+      BBGU_AUTO_LOGIN_ON_EXPIRED: '1'
+      BBGU_SILENT_RENEW_ON_EXPIRED: '1'
+      BBGU_LOGIN_WAIT_SECONDS: '300'
+      BBGU_NOTIFY_NO_CHANGE: '0'
+    steps:
+      - name: 检出程序
+        uses: actions/checkout@v4
+
+      - name: 配置Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装Node.js依赖
+        run: npm ci
+
+      - name: 安装Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: 恢复加密状态
+        env:
+          BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$BBGU_DATA_DIR"
+          git fetch origin '+refs/heads/state:refs/remotes/origin/state' || true
+          if git cat-file -e 'refs/remotes/origin/state:bbgu-state.enc' 2>/dev/null; then
+            git show 'refs/remotes/origin/state:bbgu-state.enc' > "$RUNNER_TEMP/bbgu-state.enc"
+            node scripts/state-crypto.js decrypt "$RUNNER_TEMP/bbgu-state.enc" "$RUNNER_TEMP/bbgu-state.tar.gz"
+            tar -xzf "$RUNNER_TEMP/bbgu-state.tar.gz" -C "$BBGU_DATA_DIR"
+            echo '[BBGU] 已恢复加密登录状态。'
+          else
+            echo '[BBGU] 未发现state分支，首次运行请选择login。'
+          fi
+
+      - name: 执行BBGU任务
+        id: run_bbgu
+        continue-on-error: true
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          BBGU_TERM: ${{ vars.BBGU_TERM }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
+            mode='${{ inputs.mode }}'
+          elif [[ "${{ github.event.schedule }}" == '30 1-23/2 * * *' ]]; then
+            mode='renew'
+          else
+            mode='watch'
+          fi
+
+          case "$mode" in
+            renew) node bbgu_grade_watch.js renew ;;
+            login) node bbgu_grade_watch.js login ;;
+            watch) node bbgu_grade_watch.js ;;
+            *) echo "未知模式：$mode" >&2; exit 2 ;;
+          esac
+
+      - name: 加密并保存状态
+        if: always()
+        env:
+          BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          names=(
+            bbgu_token.env
+            bbgu_storage_state.json
+            bbgu_grade_snapshot.json
+            bbgu_auth_expired_state.json
+            bbgu_qr_reminder_state.json
+          )
+          files=()
+          for name in "${names[@]}"; do
+            [[ -f "$BBGU_DATA_DIR/$name" ]] && files+=("$name")
+          done
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo '[BBGU] 没有可保存的状态文件。'
+            exit 0
+          fi
+
+          tar -czf "$RUNNER_TEMP/bbgu-state.tar.gz" -C "$BBGU_DATA_DIR" "${files[@]}"
+          node scripts/state-crypto.js encrypt "$RUNNER_TEMP/bbgu-state.tar.gz" "$RUNNER_TEMP/bbgu-state.enc"
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin '+refs/heads/state:refs/remotes/origin/state' || true
+          state_worktree="$RUNNER_TEMP/bbgu-state-branch"
+          trap 'git worktree remove --force "$state_worktree" >/dev/null 2>&1 || true' EXIT
+
+          if git show-ref --verify --quiet refs/remotes/origin/state; then
+            git worktree add -b state-update "$state_worktree" origin/state
+          else
+            git worktree add --detach "$state_worktree" HEAD
+            git -C "$state_worktree" switch --orphan state-update
+            git -C "$state_worktree" rm -rf --ignore-unmatch .
+          fi
+
+          cp "$RUNNER_TEMP/bbgu-state.enc" "$state_worktree/bbgu-state.enc"
+          git -C "$state_worktree" add bbgu-state.enc
+          git -C "$state_worktree" commit -m 'chore: update encrypted BBGU state'
+          git -C "$state_worktree" push origin HEAD:state
+
+      - name: 恢复任务失败结果
+        if: steps.run_bbgu.outcome == 'failure'
+        run: exit 1

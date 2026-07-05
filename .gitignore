@@ -1,0 +1,13 @@
+node_modules/
+bbgu-data/
+bbgu-state.enc
+bbgu-state.tar.gz
+bbgu_token.env
+bbgu_storage_state.json
+bbgu_grade_snapshot.json
+bbgu_auth_expired_state.json
+bbgu_qr_reminder_state.json
+bbgu_diagnostics/
+*.png
+*.jpg
+*.jpeg

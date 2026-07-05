@@ -49,6 +49,7 @@ const {
   decodeQrPayloadFromPngFile,
   saveLoginTimeoutDiagnostics,
   selectChromiumExecutable,
+  launchChromium,
   getConfig,
   isLikelyQrLoginUrl,
   extractLoginDebugUrlsFromHtml,
@@ -716,6 +717,12 @@ test('getConfig enables silent CAS renew on expired token by default', () => {
   assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token', BBGU_SILENT_RENEW_ON_EXPIRED: '0' }).silentRenewOnExpired, false);
 });
 
+test('getConfig读取BBGU_PROXY_SERVER', () => {
+  const config = getConfig({ BBGU_PROXY_SERVER: 'http://127.0.0.1:7890' });
+
+  assert.equal(config.proxyServer, 'http://127.0.0.1:7890');
+});
+
 test('buildCasRenewUrl points CAS back to the SAM callback route', () => {
   assert.equal(
     buildCasRenewUrl({ homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home' }),
@@ -1369,4 +1376,19 @@ test('selectChromiumExecutable prefers system Chromium on Alpine over Playwright
   });
 
   assert.equal(selected, '/usr/bin/chromium');
+});
+
+test('launchChromium将代理传给Playwright', async () => {
+  const calls = [];
+  await launchChromium({
+    async launch(options) {
+      calls.push(options);
+      return { ok: true };
+    },
+  }, {
+    headless: true,
+    proxyServer: 'http://127.0.0.1:7890',
+  });
+
+  assert.deepEqual(calls[0].proxy, { server: 'http://127.0.0.1:7890' });
 });

@@ -1041,6 +1041,7 @@ function getConfig(env = process.env) {
     pushplusToken: clean(env.PUSHPLUS_TOKEN),
     homeUrl: clean(env.BBGU_HOME_URL) || DEFAULT_HOME_URL,
     term: clean(env.BBGU_TERM),
+    proxyServer: clean(env.BBGU_PROXY_SERVER),
     dataDir,
     cookie: clean(env.BBGU_COOKIE),
     authorization: buildAuthorizationHeader(env.BBGU_AUTHORIZATION, env.BBGU_ACCESS_TOKEN),
@@ -1759,6 +1760,7 @@ async function launchChromium(chromium, config) {
   const launchOptions = {
     headless: config.headless,
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    ...(config.proxyServer ? { proxy: { server: config.proxyServer } } : {}),
   };
 
   try {

@@ -29,11 +29,17 @@ test('Workflow不持久化登录态明文', () => {
   assert.match(yaml, /git -C "\$state_worktree" add bbgu-state\.enc/);
 });
 
-test('Workflow在登录前记录DNS与IPv4和IPv6连通性', () => {
+test('Workflow通过Mihomo代理访问教务系统', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
 
-  assert.match(yaml, /getent ahosts zhjw\.bbgu\.edu\.cn/);
-  assert.match(yaml, /curl -4[\s\S]*?zhjw\.bbgu\.edu\.cn\/workspace\/home/);
-  assert.match(yaml, /curl -6[\s\S]*?zhjw\.bbgu\.edu\.cn\/workspace\/home/);
-  assert.match(yaml, /continue-on-error: true/);
+  assert.match(yaml, /node-version: ['"]24['"]/);
+  assert.match(yaml, /CLASH_SUBSCRIPTION_URL: \$\{\{ secrets\.CLASH_SUBSCRIPTION_URL \}\}/);
+  assert.match(yaml, /docker\.io\/metacubex\/mihomo:Alpha/);
+  assert.match(yaml, /proxy-providers:/);
+  assert.match(yaml, /type: url-test/);
+  assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
+  assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);
+  assert.match(yaml, /BBGU_PROXY_SERVER: http:\/\/127\.0\.0\.1:7890/);
+  assert.match(yaml, /NO_PROXY: .*pushplus/);
+  assert.match(yaml, /docker rm -f bbgu-mihomo/);
 });

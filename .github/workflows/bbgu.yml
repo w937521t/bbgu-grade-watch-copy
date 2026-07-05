@@ -37,25 +37,10 @@ jobs:
       - name: 检出程序
         uses: actions/checkout@v4
 
-      - name: 诊断教务系统网络
-        continue-on-error: true
-        run: |
-          set +e
-          echo '=== DNS ==='
-          getent ahosts zhjw.bbgu.edu.cn
-          echo '=== IPv4 HTTPS ==='
-          curl -4 -I -L --connect-timeout 10 --max-time 20 -o /dev/null -sS \
-            -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s\n' \
-            https://zhjw.bbgu.edu.cn/workspace/home
-          echo '=== IPv6 HTTPS ==='
-          curl -6 -I -L --connect-timeout 10 --max-time 20 -o /dev/null -sS \
-            -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s\n' \
-            https://zhjw.bbgu.edu.cn/workspace/home
-
       - name: 配置Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
 
       - name: 安装Node.js依赖
@@ -63,6 +48,72 @@ jobs:
 
       - name: 安装Chromium
         run: npx playwright install --with-deps chromium
+
+      - name: 启动并验证Mihomo代理
+        env:
+          CLASH_SUBSCRIPTION_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLASH_SUBSCRIPTION_URL:-}" ]]; then
+            echo '[BBGU] 缺少CLASH_SUBSCRIPTION_URL Secret。' >&2
+            exit 1
+          fi
+
+          mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
+          mkdir -p "$mihomo_dir/providers"
+          subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
+          cat > "$mihomo_dir/config.yaml" <<EOF
+          mixed-port: 7890
+          allow-lan: false
+          bind-address: 127.0.0.1
+          mode: rule
+          log-level: warning
+          ipv6: false
+          proxy-providers:
+            airport:
+              type: http
+              url: $subscription_json
+              path: ./providers/airport.yaml
+              interval: 3600
+              filter: "(?i)(香港|港|HK|Hong Kong|台湾|台|TW|Taiwan|日本|JP|Japan)"
+              exclude-filter: "(?i)(剩余|流量|到期|官网|套餐)"
+              health-check:
+                enable: true
+                url: https://zhjw.bbgu.edu.cn/workspace/home
+                interval: 300
+                timeout: 10000
+                lazy: false
+          proxy-groups:
+            - name: BBGU-AUTO
+              type: url-test
+              use: [airport]
+              url: https://zhjw.bbgu.edu.cn/workspace/home
+              interval: 300
+              timeout: 10000
+              lazy: false
+          rules:
+            - MATCH,BBGU-AUTO
+          EOF
+
+          docker pull docker.io/metacubex/mihomo:Alpha
+          docker run -d --name bbgu-mihomo --network host \
+            -v "$mihomo_dir:/root/.config/mihomo" \
+            docker.io/metacubex/mihomo:Alpha >/dev/null
+
+          for attempt in {1..12}; do
+            if result="$(curl -f -I -L --proxy http://127.0.0.1:7890 \
+              --connect-timeout 5 --max-time 10 -o /dev/null -sS \
+              -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s' \
+              https://zhjw.bbgu.edu.cn/workspace/home 2>/dev/null)"; then
+              echo "[BBGU] Mihomo代理可用：$result"
+              exit 0
+            fi
+            echo "[BBGU] 等待可用的HK/TW/JP节点（$attempt/12）..."
+            sleep 5
+          done
+
+          echo '[BBGU] 所有候选代理节点均无法访问教务系统。' >&2
+          exit 1
 
       - name: 恢复加密状态
         env:
@@ -86,6 +137,11 @@ jobs:
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           BBGU_TERM: ${{ vars.BBGU_TERM }}
+          NODE_USE_ENV_PROXY: '1'
+          HTTP_PROXY: http://127.0.0.1:7890
+          HTTPS_PROXY: http://127.0.0.1:7890
+          BBGU_PROXY_SERVER: http://127.0.0.1:7890
+          NO_PROXY: 127.0.0.1,localhost,github.com,api.github.com,www.pushplus.plus
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
@@ -147,6 +203,10 @@ jobs:
           git -C "$state_worktree" add bbgu-state.enc
           git -C "$state_worktree" commit -m 'chore: update encrypted BBGU state'
           git -C "$state_worktree" push origin HEAD:state
+
+      - name: 停止Mihomo
+        if: always()
+        run: docker rm -f bbgu-mihomo >/dev/null 2>&1 || true
 
       - name: 恢复任务失败结果
         if: steps.run_bbgu.outcome == 'failure'

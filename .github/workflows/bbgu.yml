@@ -67,7 +67,7 @@ jobs:
           allow-lan: false
           bind-address: 127.0.0.1
           mode: rule
-          log-level: warning
+          log-level: info
           ipv6: false
           proxy-providers:
             airport:
@@ -101,7 +101,8 @@ jobs:
             docker.io/metacubex/mihomo:Alpha >/dev/null
 
           for attempt in {1..12}; do
-            if result="$(curl -f -I -L --proxy http://127.0.0.1:7890 \
+            if result="$(curl -f -L --proxy http://127.0.0.1:7890 \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
               --connect-timeout 5 --max-time 10 -o /dev/null -sS \
               -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s' \
               https://zhjw.bbgu.edu.cn/workspace/home 2>/dev/null)"; then
@@ -203,6 +204,10 @@ jobs:
           git -C "$state_worktree" add bbgu-state.enc
           git -C "$state_worktree" commit -m 'chore: update encrypted BBGU state'
           git -C "$state_worktree" push origin HEAD:state
+
+      - name: Mihomo诊断日志
+        if: steps.run_bbgu.outcome == 'failure'
+        run: docker logs --tail 100 bbgu-mihomo 2>&1 || true
 
       - name: 停止Mihomo
         if: always()

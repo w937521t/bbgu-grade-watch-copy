@@ -43,3 +43,13 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /NO_PROXY: .*pushplus/);
   assert.match(yaml, /docker rm -f bbgu-mihomo/);
 });
+
+test('Workflow用浏览器式GET验证代理并在主任务失败时输出Mihomo日志', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+
+  assert.doesNotMatch(yaml, /curl -f -I -L --proxy/);
+  assert.match(yaml, /curl -f -L --proxy[\s\S]*?-A ['"]Mozilla\/5\.0/);
+  assert.match(yaml, /name: Mihomo诊断日志/);
+  assert.match(yaml, /if: steps\.run_bbgu\.outcome == 'failure'/);
+  assert.match(yaml, /docker logs --tail 100 bbgu-mihomo/);
+});

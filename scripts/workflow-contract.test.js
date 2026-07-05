@@ -28,3 +28,12 @@ test('Workflow不持久化登录态明文', () => {
   assert.match(yaml, /node scripts\/state-crypto\.js encrypt/);
   assert.match(yaml, /git -C "\$state_worktree" add bbgu-state\.enc/);
 });
+
+test('Workflow在登录前记录DNS与IPv4和IPv6连通性', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+
+  assert.match(yaml, /getent ahosts zhjw\.bbgu\.edu\.cn/);
+  assert.match(yaml, /curl -4[\s\S]*?zhjw\.bbgu\.edu\.cn\/workspace\/home/);
+  assert.match(yaml, /curl -6[\s\S]*?zhjw\.bbgu\.edu\.cn\/workspace\/home/);
+  assert.match(yaml, /continue-on-error: true/);
+});

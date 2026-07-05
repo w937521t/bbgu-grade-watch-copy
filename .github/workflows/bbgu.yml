@@ -37,6 +37,21 @@ jobs:
       - name: 检出程序
         uses: actions/checkout@v4
 
+      - name: 诊断教务系统网络
+        continue-on-error: true
+        run: |
+          set +e
+          echo '=== DNS ==='
+          getent ahosts zhjw.bbgu.edu.cn
+          echo '=== IPv4 HTTPS ==='
+          curl -4 -I -L --connect-timeout 10 --max-time 20 -o /dev/null -sS \
+            -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s\n' \
+            https://zhjw.bbgu.edu.cn/workspace/home
+          echo '=== IPv6 HTTPS ==='
+          curl -6 -I -L --connect-timeout 10 --max-time 20 -o /dev/null -sS \
+            -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s\n' \
+            https://zhjw.bbgu.edu.cn/workspace/home
+
       - name: 配置Node.js
         uses: actions/setup-node@v4
         with:

@@ -1981,7 +1981,7 @@ async function runLogin(config = getConfig(), options = {}) {
       console.log('[BBGU] Cleared saved browser access token before login fallback.');
     }
     console.log(`[BBGU] Opening ${config.homeUrl} for login.`);
-    await page.goto(config.homeUrl, { waitUntil: 'networkidle', timeout: 60000 });
+    await navigateToLoginPage(page, config.homeUrl);
     await page.waitForTimeout(3000);
 
     let token = ignoreInitialAccessToken ? '' : await extractAccessTokenFromPage(page);
@@ -2084,6 +2084,10 @@ async function maybeRunScheduledQr(config, deps = {}) {
   return result;
 }
 
+async function navigateToLoginPage(page, homeUrl) {
+  return page.goto(homeUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+}
+
 async function runRenew(config = getConfig(), deps = {}) {
   const {
     nowFn = Date.now,
@@ -2179,7 +2183,7 @@ async function runLoginDebug(config = getConfig()) {
   return withBrowserContext(config, createDebugContext, async (context) => {
     const page = await context.newPage();
     console.log(`[BBGU] Opening ${config.homeUrl} for login debug without saved storage state.`);
-    await page.goto(config.homeUrl, { waitUntil: 'networkidle', timeout: 60000 });
+    await navigateToLoginPage(page, config.homeUrl);
     await page.waitForTimeout(5000);
 
     const diagnostic = await saveLoginDebugReport(page, config);
@@ -2277,6 +2281,7 @@ module.exports = {
   extractAuthStateFromPage,
   saveBrowserAuthState,
   clearBrowserAccessTokens,
+  navigateToLoginPage,
   createWeixinQrCapture,
   selectChromiumExecutable,
   findChromiumExecutable,

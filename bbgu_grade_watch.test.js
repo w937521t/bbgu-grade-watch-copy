@@ -59,6 +59,7 @@ const {
   run,
   runRenew,
   clearBrowserAccessTokens,
+  navigateToLoginPage,
 } = bbguGradeWatch;
 
 function makeJwt(payload) {
@@ -1048,6 +1049,23 @@ test('clearBrowserAccessTokens removes saved CQU access token keys', async () =>
     'cqu_edu_CURRENT_TOKEN',
     'cqu_edu_EXPIRE_ACCESS_TOKEN',
   ]);
+});
+
+test('navigateToLoginPage等待DOM完成而不是等待网络完全空闲', async () => {
+  const calls = [];
+  const page = {
+    async goto(url, options) {
+      calls.push({ url, options });
+      return { ok: true };
+    },
+  };
+
+  await navigateToLoginPage(page, 'https://zhjw.bbgu.edu.cn/workspace/home');
+
+  assert.deepEqual(calls, [{
+    url: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    options: { waitUntil: 'domcontentloaded', timeout: 60000 },
+  }]);
 });
 
 test('extractAuthStateFromPage reads access and refresh tokens', async () => {

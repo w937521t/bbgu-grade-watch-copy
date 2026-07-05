@@ -160,6 +160,15 @@ jobs:
             *) echo "未知模式：$mode" >&2; exit 2 ;;
           esac
 
+      - name: 上传登录诊断
+        if: steps.run_bbgu.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbgu-login-diagnostics-${{ github.run_id }}
+          path: ${{ env.BBGU_DATA_DIR }}/bbgu_diagnostics/
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: 加密并保存状态
         if: always()
         env:

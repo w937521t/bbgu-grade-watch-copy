@@ -23,10 +23,25 @@ test('Workflow保持青龙定时并使用加密状态分支', () => {
 test('Workflow不持久化登录态明文', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
 
-  assert.doesNotMatch(yaml, /upload-artifact|actions\/cache/);
+  assert.doesNotMatch(yaml, /actions\/cache/);
   assert.doesNotMatch(yaml, /git add .*bbgu_token\.env/);
   assert.match(yaml, /node scripts\/state-crypto\.js encrypt/);
   assert.match(yaml, /git -C "\$state_worktree" add bbgu-state\.enc/);
+});
+
+test('Workflow失败时只上传短期登录诊断', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+
+  assert.match(yaml, /name: 上传登录诊断/);
+  assert.match(yaml, /if: steps\.run_bbgu\.outcome == 'failure'/);
+  assert.match(yaml, /uses: actions\/upload-artifact@v4/);
+  assert.match(yaml, /name: bbgu-login-diagnostics-\$\{\{ github\.run_id \}\}/);
+  assert.match(yaml, /path: \$\{\{ env\.BBGU_DATA_DIR \}\}\/bbgu_diagnostics\//);
+  assert.match(yaml, /if-no-files-found: ignore/);
+  assert.match(yaml, /retention-days: 1/);
+
+  const uploadStep = yaml.match(/- name: 上传登录诊断[\s\S]*?(?=\n      - name:|$)/)?.[0] || '';
+  assert.doesNotMatch(uploadStep, /bbgu_token|storage_state|bbgu-state|\.env|\.enc/);
 });
 
 test('Workflow通过Mihomo代理访问教务系统', () => {

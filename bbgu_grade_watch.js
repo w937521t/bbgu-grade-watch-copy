@@ -915,19 +915,32 @@ function renderQrCodeHtml(textQr) {
   return `<div style="font-family:Consolas,'Courier New',monospace;font-size:8px;line-height:8px;letter-spacing:0;background:#fff;color:#000;padding:8px;display:inline-block;white-space:nowrap;">${htmlLines.join('<br>')}</div>`;
 }
 
-function formatQrLoginMessage({ homeUrl, screenshotPath, qrImageUrl, textQr, waitSeconds }) {
+function formatQrLoginMessage({
+  homeUrl,
+  screenshotPath,
+  qrImageUrl,
+  textQr,
+  waitSeconds,
+  showScreenshotPath = true,
+}) {
   return [
     '# BBGU 教务系统扫码登录',
     '',
     `登录地址：${homeUrl}`,
     textQr ? '微信扫码识别下方文本二维码：' : '',
     textQr ? renderQrCodeHtml(textQr) : '',
-    screenshotPath ? `二维码截图路径：\`${screenshotPath}\`` : '',
+    showScreenshotPath && screenshotPath ? `二维码截图路径：\`${screenshotPath}\`` : '',
     qrImageUrl ? `微信二维码图片源：\`${qrImageUrl}\`（不直接展示，避免 PushPlus 缓存旧二维码）` : '',
     '',
     textQr
-      ? `脚本会等待 ${waitSeconds} 秒。请优先用微信扫描文本二维码；如果不能识别，到青龙文件管理打开上面的截图路径并扫码。`
-      : `脚本会等待 ${waitSeconds} 秒。请立刻到青龙文件管理或服务器路径查看截图并扫码。`,
+      ? showScreenshotPath
+        ? `脚本会等待 ${waitSeconds} 秒。请优先用微信扫描文本二维码；如果不能识别，到青龙文件管理打开上面的截图路径并扫码。`
+        : `脚本会等待 ${waitSeconds} 秒。请用微信扫描上方文本二维码。`
+      : showScreenshotPath
+        ? `脚本会等待 ${waitSeconds} 秒。请立刻到青龙文件管理或服务器路径查看截图并扫码。`
+        : qrImageUrl
+          ? `脚本会等待 ${waitSeconds} 秒。请打开上面的微信二维码图片源并扫码。`
+          : '文本二维码生成失败，本次无法从GitHub完成扫码，请查看Actions日志。',
     '',
     '扫码成功后脚本会自动保存 access/refresh token，后续定时任务会自动读取保存的认证状态。',
   ].filter(Boolean).join('\n');
@@ -1042,6 +1055,7 @@ function getConfig(env = process.env) {
     homeUrl: clean(env.BBGU_HOME_URL) || DEFAULT_HOME_URL,
     term: clean(env.BBGU_TERM),
     proxyServer: clean(env.BBGU_PROXY_SERVER),
+    githubActions: parseBooleanEnv(env.GITHUB_ACTIONS, false),
     dataDir,
     cookie: clean(env.BBGU_COOKIE),
     authorization: buildAuthorizationHeader(env.BBGU_AUTHORIZATION, env.BBGU_ACCESS_TOKEN),
@@ -2015,7 +2029,9 @@ async function runLogin(config = getConfig(), options = {}) {
         console.log(`[BBGU] QR element screenshot saved: ${qrElementScreenshotPath}`);
       }
       if (!textQr) {
-        console.log('[BBGU] PushPlus will send screenshot path only because text QR is unavailable.');
+        console.log(config.githubActions
+          ? '[BBGU] Text QR is unavailable in GitHub Actions; local screenshot path will not be pushed.'
+          : '[BBGU] PushPlus will send screenshot path only because text QR is unavailable.');
       }
       await sendPushPlus({
         token: config.pushplusToken,
@@ -2026,6 +2042,7 @@ async function runLogin(config = getConfig(), options = {}) {
           qrImageUrl,
           textQr,
           waitSeconds: config.loginWaitSeconds,
+          showScreenshotPath: !config.githubActions,
         }),
       });
       console.log(`[BBGU] QR login screenshot saved: ${screenshotPath}`);

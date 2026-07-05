@@ -701,6 +701,20 @@ test('formatQrLoginMessage can render text QR fallback without official QR image
   assert.match(message, /access\/refresh token/);
 });
 
+test('formatQrLoginMessage在GitHub环境隐藏无用的Runner截图路径', () => {
+  const message = formatQrLoginMessage({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    screenshotPath: '/home/runner/work/bbgu-data/qr.png',
+    textQr: '██  ██\n  ████',
+    waitSeconds: 300,
+    showScreenshotPath: false,
+  });
+
+  assert.match(message, /微信扫码识别下方文本二维码/);
+  assert.doesNotMatch(message, /\/home\/runner/);
+  assert.doesNotMatch(message, /青龙文件管理/);
+});
+
 test('buildWeixinQrConfirmUrl converts WeChat qrcode image URL to scan confirmation URL', () => {
   assert.equal(
     buildWeixinQrConfirmUrl('https://open.weixin.qq.com/connect/qrcode/021j3AB52fDaGa12'),
@@ -765,6 +779,12 @@ test('getConfig读取BBGU_PROXY_SERVER', () => {
   const config = getConfig({ BBGU_PROXY_SERVER: 'http://127.0.0.1:7890' });
 
   assert.equal(config.proxyServer, 'http://127.0.0.1:7890');
+});
+
+test('getConfig识别GitHub Actions运行环境', () => {
+  const config = getConfig({ GITHUB_ACTIONS: 'true' });
+
+  assert.equal(config.githubActions, true);
 });
 
 test('buildCasRenewUrl points CAS back to the SAM callback route', () => {

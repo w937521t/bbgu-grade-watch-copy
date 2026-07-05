@@ -636,6 +636,50 @@ test('decodeQrPayloadFromPngFile decodes QR payload from PNG pixels', async () =
   }
 });
 
+test('已安装的二维码依赖可以真实解码PNG并渲染文本二维码', async () => {
+  const { PNG } = require('pngjs');
+  const QRCode = require('qrcode-terminal/vendor/QRCode');
+  const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel');
+  const payload = 'https://example.com/bbgu-qr-test';
+  const qr = new QRCode(-1, QRErrorCorrectLevel.M);
+  qr.addData(payload);
+  qr.make();
+
+  const scale = 8;
+  const border = 4;
+  const moduleCount = qr.getModuleCount();
+  const size = (moduleCount + border * 2) * scale;
+  const png = new PNG({ width: size, height: size });
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const row = Math.floor(y / scale) - border;
+      const column = Math.floor(x / scale) - border;
+      const black = row >= 0 && column >= 0
+        && row < moduleCount && column < moduleCount
+        && qr.modules[row][column];
+      const offset = (y * size + x) * 4;
+      const value = black ? 0 : 255;
+      png.data[offset] = value;
+      png.data[offset + 1] = value;
+      png.data[offset + 2] = value;
+      png.data[offset + 3] = 255;
+    }
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-real-qr-'));
+  const imagePath = path.join(tempDir, 'qr.png');
+  try {
+    await fs.writeFile(imagePath, PNG.sync.write(png));
+    const decoded = await decodeQrPayloadFromPngFile(imagePath);
+    const textQr = renderTerminalQrCode(decoded);
+
+    assert.equal(decoded, payload);
+    assert.ok(textQr.split(/\r?\n/).length >= 5);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('formatQrLoginMessage can render text QR fallback without official QR image or failing mobile link', () => {
   const message = formatQrLoginMessage({
     homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',

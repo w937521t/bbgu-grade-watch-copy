@@ -52,6 +52,10 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /docker\.io\/metacubex\/mihomo:Alpha/);
   assert.match(yaml, /proxy-providers:/);
   assert.match(yaml, /type: url-test/);
+  assert.doesNotMatch(yaml, /filter: .*香港.*HK.*台湾.*TW.*日本.*JP/);
+  assert.doesNotMatch(yaml, /等待可用的HK\/TW\/JP节点/);
+  assert.match(yaml, /exclude-filter: .*剩余.*流量.*到期.*官网.*套餐/);
+  assert.match(yaml, /echo "\[BBGU\] 等待可用代理节点（\$attempt\/12）\.\.\."/);
   assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);
   assert.match(yaml, /BBGU_PROXY_SERVER: http:\/\/127\.0\.0\.1:7890/);

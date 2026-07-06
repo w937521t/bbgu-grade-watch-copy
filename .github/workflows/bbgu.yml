@@ -75,7 +75,6 @@ jobs:
               url: $subscription_json
               path: ./providers/airport.yaml
               interval: 3600
-              filter: "(?i)(香港|港|HK|Hong Kong|台湾|台|TW|Taiwan|日本|JP|Japan)"
               exclude-filter: "(?i)(剩余|流量|到期|官网|套餐)"
               health-check:
                 enable: true
@@ -109,7 +108,7 @@ jobs:
               echo "[BBGU] Mihomo代理可用：$result"
               exit 0
             fi
-            echo "[BBGU] 等待可用的HK/TW/JP节点（$attempt/12）..."
+            echo "[BBGU] 等待可用代理节点（$attempt/12）..."
             sleep 5
           done
 

@@ -392,6 +392,46 @@ test('requestJsonText在GitHub代理模式下不回退到直连HTTPS', async () 
   }
 });
 
+test('requestJsonText在代理模式下遇到fetch严格解析错误时改用代理HTTPS后备', async () => {
+  const originalGithubActions = process.env.GITHUB_ACTIONS;
+  const originalProxyServer = process.env.BBGU_PROXY_SERVER;
+  const calls = [];
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.BBGU_PROXY_SERVER = 'http://127.0.0.1:7890';
+
+  try {
+    const response = await requestJsonText('https://zhjw.bbgu.edu.cn/api/sam/score/student/score', {}, {
+      fetchFn: async () => {
+        throw Object.assign(new TypeError('fetch failed'), {
+          cause: new Error('Response does not match the HTTP/1.1 protocol (Missing expected CR after header value)'),
+        });
+      },
+      proxyHttpsRequestFn: async (url, headers, proxyServer) => {
+        calls.push({ url, headers, proxyServer });
+        return { status: 200, text: '{"ok":true}', via: 'proxy-https' };
+      },
+    });
+
+    assert.deepEqual(response, { status: 200, text: '{"ok":true}', via: 'proxy-https' });
+    assert.deepEqual(calls, [{
+      url: 'https://zhjw.bbgu.edu.cn/api/sam/score/student/score',
+      headers: {},
+      proxyServer: 'http://127.0.0.1:7890',
+    }]);
+  } finally {
+    if (originalGithubActions === undefined) {
+      delete process.env.GITHUB_ACTIONS;
+    } else {
+      process.env.GITHUB_ACTIONS = originalGithubActions;
+    }
+    if (originalProxyServer === undefined) {
+      delete process.env.BBGU_PROXY_SERVER;
+    } else {
+      process.env.BBGU_PROXY_SERVER = originalProxyServer;
+    }
+  }
+});
+
 test('calculateTermArithmeticAverage only uses numeric scores from selected term', () => {
   assert.deepEqual(calculateTermArithmeticAverage([
     { courseName: 'A', score: '99', term: '2026春' },

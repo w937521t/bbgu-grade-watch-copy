@@ -4,7 +4,9 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const https = require('node:https');
+const net = require('node:net');
 const path = require('node:path');
+const tls = require('node:tls');
 const util = require('node:util');
 
 const DEFAULT_HOME_URL = 'https://zhjw.bbgu.edu.cn/workspace/home';
@@ -1419,9 +1421,13 @@ async function enrichRowsWithSubScores(diff, config, fetcher = fetchBbguSubScore
   return { fetched, failed };
 }
 
-async function requestJsonText(url, headers) {
+async function requestJsonText(url, headers, deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+  const httpsRequestFn = deps.httpsRequestFn || requestJsonTextWithHttps;
+  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const proxyServer = clean(deps.proxyServer || process.env.BBGU_PROXY_SERVER || '');
   try {
-    const response = await fetch(url, { method: 'GET', headers });
+    const response = await fetchFn(url, { method: 'GET', headers });
     return {
       status: response.status,
       text: await response.text(),
@@ -1430,12 +1436,27 @@ async function requestJsonText(url, headers) {
   } catch (error) {
     const cause = error && error.cause ? error.cause : error;
     if (process.env.GITHUB_ACTIONS || process.env.BBGU_PROXY_SERVER) {
+      if (proxyServer && isHttpParserFetchFailure(error)) {
+        console.log(`[BBGU] fetch failed in proxy mode due to strict HTTP parsing; retrying through proxy with native https. reason=${cause && (cause.code || cause.message)}`);
+        return proxyHttpsRequestFn(url, headers, proxyServer);
+      }
       console.log(`[BBGU] fetch failed in proxy mode; native https fallback disabled. reason=${cause && (cause.code || cause.message)}`);
       throw error;
     }
     console.log(`[BBGU] fetch failed, retrying with native https. reason=${cause && (cause.code || cause.message)}`);
-    return requestJsonTextWithHttps(url, headers);
+    return httpsRequestFn(url, headers);
   }
+}
+
+function isHttpParserFetchFailure(error) {
+  const messages = [];
+  let current = error;
+  while (current) {
+    if (current.code) messages.push(String(current.code));
+    if (current.message) messages.push(String(current.message));
+    current = current.cause;
+  }
+  return /HTTP\/1\.1 protocol|Missing expected CR after header value|HPE_/i.test(messages.join('\n'));
 }
 
 function requestJsonTextWithHttps(url, headers) {
@@ -1467,6 +1488,112 @@ function requestJsonTextWithHttps(url, headers) {
       reject(new Error(`BBGU score API network error: ${message}`));
     });
     request.end();
+  });
+}
+
+function requestJsonTextWithHttpsProxy(url, headers, proxyServer) {
+  const target = new URL(url);
+  const proxy = new URL(proxyServer);
+  if (target.protocol !== 'https:') {
+    return Promise.reject(new Error(`Proxy HTTPS fallback only supports https URLs: ${target.protocol}`));
+  }
+  if (proxy.protocol !== 'http:') {
+    return Promise.reject(new Error(`Proxy HTTPS fallback only supports http proxy URLs: ${proxy.protocol}`));
+  }
+
+  return new Promise((resolve, reject) => {
+    const proxyPort = Number(proxy.port || 80);
+    const targetPort = Number(target.port || 443);
+    const targetHostPort = `${target.hostname}:${targetPort}`;
+    const proxyHost = proxy.hostname;
+    const proxyHeaders = [
+      `CONNECT ${targetHostPort} HTTP/1.1`,
+      `Host: ${targetHostPort}`,
+      'Proxy-Connection: keep-alive',
+    ];
+    if (proxy.username || proxy.password) {
+      const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64');
+      proxyHeaders.push(`Proxy-Authorization: Basic ${auth}`);
+    }
+
+    let settled = false;
+    let socket;
+    let connectBuffer = Buffer.alloc(0);
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      if (socket) socket.destroy();
+      reject(error);
+    };
+
+    socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
+      socket.write(`${proxyHeaders.join('\r\n')}\r\n\r\n`);
+    });
+    socket.setTimeout(30000, () => {
+      finishReject(new Error('Proxy CONNECT timeout after 30000ms'));
+    });
+    socket.on('error', (error) => {
+      finishReject(error);
+    });
+    socket.on('data', function onConnectData(chunk) {
+      connectBuffer = Buffer.concat([connectBuffer, chunk]);
+      const headerEnd = connectBuffer.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+
+      socket.off('data', onConnectData);
+      const headerText = connectBuffer.slice(0, headerEnd).toString('latin1');
+      const leftover = connectBuffer.slice(headerEnd + 4);
+      const statusMatch = headerText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/i);
+      const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+      if (statusCode !== 200) {
+        finishReject(new Error(`Proxy CONNECT failed with status ${statusCode || 'unknown'}`));
+        return;
+      }
+      if (leftover.length) socket.unshift(leftover);
+
+      const secureSocket = tls.connect({
+        socket,
+        servername: target.hostname,
+        ALPNProtocols: ['http/1.1'],
+      }, () => {
+        const request = https.request({
+          protocol: 'https:',
+          hostname: target.hostname,
+          port: targetPort,
+          path: `${target.pathname}${target.search}`,
+          method: 'GET',
+          headers,
+          timeout: 30000,
+          agent: false,
+          createConnection: () => secureSocket,
+          insecureHTTPParser: true,
+        }, (response) => {
+          const chunks = [];
+          response.setEncoding('utf8');
+          response.on('data', (responseChunk) => chunks.push(responseChunk));
+          response.on('end', () => {
+            if (settled) return;
+            settled = true;
+            resolve({
+              status: response.statusCode || 0,
+              text: chunks.join(''),
+              via: 'proxy-https',
+            });
+          });
+        });
+
+        request.on('timeout', () => {
+          request.destroy(new Error('Proxy HTTPS request timeout after 30000ms'));
+        });
+        request.on('error', (error) => {
+          finishReject(error);
+        });
+        request.end();
+      });
+      secureSocket.on('error', (error) => {
+        finishReject(error);
+      });
+    });
   });
 }
 

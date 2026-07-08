@@ -48,6 +48,8 @@ const {
   renderTerminalQrCode,
   decodeQrPayloadFromPngFile,
   saveLoginTimeoutDiagnostics,
+  shouldAbortGithubQrLogin,
+  installPageRequestFailureCapture,
   selectChromiumExecutable,
   launchChromium,
   getConfig,
@@ -57,6 +59,7 @@ const {
   extractWeixinQrInfoFromHtml,
   extractWeixinQrConnectUrlFromHtml,
   recoverDirectApiAfterAuthExpired,
+  requestJsonText,
   run,
   runRenew,
   clearBrowserAccessTokens,
@@ -351,10 +354,41 @@ test('sendPushPlus can send HTML template messages', async () => {
     });
 
     const body = JSON.parse(calls[0].options.body);
+    assert.equal(calls[0].url, 'https://www.pushplus.plus/send');
     assert.equal(body.template, 'html');
     assert.equal(body.content, '<div>ok</div>');
   } finally {
     global.fetch = originalFetch;
+  }
+});
+
+test('requestJsonText在GitHub代理模式下不回退到直连HTTPS', async () => {
+  const originalFetch = global.fetch;
+  const originalGithubActions = process.env.GITHUB_ACTIONS;
+  const originalProxyServer = process.env.BBGU_PROXY_SERVER;
+  global.fetch = async () => {
+    throw Object.assign(new Error('proxy tunnel failed'), { cause: { code: 'ERR_TUNNEL_CONNECTION_FAILED' } });
+  };
+  process.env.GITHUB_ACTIONS = 'true';
+  process.env.BBGU_PROXY_SERVER = 'http://127.0.0.1:7890';
+
+  try {
+    await assert.rejects(
+      () => requestJsonText('https://zhjw.bbgu.edu.cn/api/sam/score/student/score', {}),
+      /proxy tunnel failed|ERR_TUNNEL_CONNECTION_FAILED/
+    );
+  } finally {
+    global.fetch = originalFetch;
+    if (originalGithubActions === undefined) {
+      delete process.env.GITHUB_ACTIONS;
+    } else {
+      process.env.GITHUB_ACTIONS = originalGithubActions;
+    }
+    if (originalProxyServer === undefined) {
+      delete process.env.BBGU_PROXY_SERVER;
+    } else {
+      process.env.BBGU_PROXY_SERVER = originalProxyServer;
+    }
   }
 });
 
@@ -750,6 +784,14 @@ test('saveLoginTimeoutDiagnostics writes current login page state', async () => 
     screenshot: async ({ path: screenshotPath }) => {
       await fs.writeFile(screenshotPath, 'fake png');
     },
+    __bbguRequestFailures: [
+      {
+        url: 'https://zhjw.bbgu.edu.cn/workspace/home',
+        method: 'GET',
+        resourceType: 'document',
+        errorText: 'net::ERR_TUNNEL_CONNECTION_FAILED',
+      },
+    ],
   };
 
   try {
@@ -760,9 +802,71 @@ test('saveLoginTimeoutDiagnostics writes current login page state', async () => 
     assert.equal(report.title, '异常错误');
     assert.match(report.bodyText, /授权失败/);
     assert.equal(report.screenshotPath, diagnostic.screenshotPath);
+    assert.deepEqual(report.requestFailures, page.__bbguRequestFailures);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test('installPageRequestFailureCapture records recent browser request failures', () => {
+  const listeners = new Map();
+  const page = {
+    on: (event, handler) => listeners.set(event, handler),
+  };
+  installPageRequestFailureCapture(page, 2);
+  const handler = listeners.get('requestfailed');
+
+  handler({
+    url: () => 'https://zhjw.bbgu.edu.cn/workspace/home',
+    method: () => 'GET',
+    resourceType: () => 'document',
+    failure: () => ({ errorText: 'net::ERR_CONNECTION_TIMED_OUT' }),
+  });
+  handler({
+    url: () => 'https://s4.zstatic.net/app.js',
+    method: () => 'GET',
+    resourceType: () => 'script',
+    failure: () => ({ errorText: 'net::ERR_ABORTED' }),
+  });
+  handler({
+    url: () => 'https://authserver.bbgu.edu.cn/authserver/login',
+    method: () => 'GET',
+    resourceType: () => 'document',
+    failure: () => ({ errorText: 'net::ERR_TUNNEL_CONNECTION_FAILED' }),
+  });
+
+  assert.deepEqual(page.__bbguRequestFailures, [
+    {
+      url: 'https://s4.zstatic.net/app.js',
+      method: 'GET',
+      resourceType: 'script',
+      errorText: 'net::ERR_ABORTED',
+    },
+    {
+      url: 'https://authserver.bbgu.edu.cn/authserver/login',
+      method: 'GET',
+      resourceType: 'document',
+      errorText: 'net::ERR_TUNNEL_CONNECTION_FAILED',
+    },
+  ]);
+});
+
+test('GitHub环境没有可扫码二维码时立即中止登录等待', () => {
+  assert.equal(shouldAbortGithubQrLogin({
+    githubActions: true,
+    textQr: '',
+    qrImageUrl: '',
+  }), true);
+  assert.equal(shouldAbortGithubQrLogin({
+    githubActions: true,
+    textQr: 'qr text',
+    qrImageUrl: '',
+  }), false);
+  assert.equal(shouldAbortGithubQrLogin({
+    githubActions: false,
+    textQr: '',
+    qrImageUrl: '',
+  }), false);
 });
 
 test('getConfig enables automatic QR login on expired token by default', () => {

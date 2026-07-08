@@ -8,7 +8,7 @@ const path = require('node:path');
 const util = require('node:util');
 
 const DEFAULT_HOME_URL = 'https://zhjw.bbgu.edu.cn/workspace/home';
-const PUSHPLUS_SEND_URL = 'http://www.pushplus.plus/send';
+const PUSHPLUS_SEND_URL = 'https://www.pushplus.plus/send';
 const BBGU_SCORE_API_URL = 'https://zhjw.bbgu.edu.cn/api/sam/score/student/score';
 const BBGU_SUBSCORE_API_PATH = '/api/sam/scoreManage/stu-score-form';
 const BBGU_BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145 Safari/537.36 Edg/145';
@@ -946,6 +946,10 @@ function formatQrLoginMessage({
   ].filter(Boolean).join('\n');
 }
 
+function shouldAbortGithubQrLogin({ githubActions, textQr, qrImageUrl }) {
+  return Boolean(githubActions && !clean(textQr) && !clean(qrImageUrl));
+}
+
 function formatNoChangeMessage({ term, count }) {
   return [
     '# BBGU 成绩检查',
@@ -1425,6 +1429,10 @@ async function requestJsonText(url, headers) {
     };
   } catch (error) {
     const cause = error && error.cause ? error.cause : error;
+    if (process.env.GITHUB_ACTIONS || process.env.BBGU_PROXY_SERVER) {
+      console.log(`[BBGU] fetch failed in proxy mode; native https fallback disabled. reason=${cause && (cause.code || cause.message)}`);
+      throw error;
+    }
     console.log(`[BBGU] fetch failed, retrying with native https. reason=${cause && (cause.code || cause.message)}`);
     return requestJsonTextWithHttps(url, headers);
   }
@@ -1559,6 +1567,25 @@ async function saveQrElementScreenshot(page, config) {
   return '';
 }
 
+function installPageRequestFailureCapture(page, limit = 20) {
+  if (!page || typeof page.on !== 'function' || page.__bbguRequestFailureCaptureInstalled) return;
+  page.__bbguRequestFailures = page.__bbguRequestFailures || [];
+  page.__bbguRequestFailureCaptureInstalled = true;
+  page.on('requestfailed', (request) => {
+    const failure = typeof request.failure === 'function' ? request.failure() : null;
+    const record = {
+      url: typeof request.url === 'function' ? request.url() : '',
+      method: typeof request.method === 'function' ? request.method() : '',
+      resourceType: typeof request.resourceType === 'function' ? request.resourceType() : '',
+      errorText: failure ? clean(failure.errorText) : '',
+    };
+    page.__bbguRequestFailures.push(record);
+    if (page.__bbguRequestFailures.length > limit) {
+      page.__bbguRequestFailures.splice(0, page.__bbguRequestFailures.length - limit);
+    }
+  });
+}
+
 async function saveLoginTimeoutDiagnostics(page, config) {
   await fsp.mkdir(config.diagnosticDir, { recursive: true });
   const screenshotPath = await saveScreenshot(page, config, 'qr-login-timeout');
@@ -1585,6 +1612,9 @@ async function saveLoginTimeoutDiagnostics(page, config) {
     title,
     bodyText,
     screenshotPath,
+    requestFailures: Array.isArray(page.__bbguRequestFailures)
+      ? page.__bbguRequestFailures.slice(-20)
+      : [],
   };
   await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
   return { reportPath, screenshotPath };
@@ -1988,6 +2018,7 @@ async function runLogin(config = getConfig(), options = {}) {
 
   return withBrowserContext(config, createContext, async (context) => {
     const page = await context.newPage();
+    installPageRequestFailureCapture(page);
     const weixinQrCapture = createWeixinQrCapture(page);
     const ignoreInitialAccessToken = Boolean(options.ignoreInitialAccessToken);
     if (ignoreInitialAccessToken) {
@@ -1999,6 +2030,10 @@ async function runLogin(config = getConfig(), options = {}) {
     console.log(`[BBGU] Opening ${config.homeUrl} for login.`);
     await navigateToLoginPage(page, config.homeUrl);
     await page.waitForTimeout(3000);
+    if (/^chrome-error:\/\//i.test(page.url())) {
+      const diagnostic = await saveLoginTimeoutDiagnostics(page, config);
+      throw new Error(`BBGU login page failed to load in Chromium. Diagnostic report: ${diagnostic.reportPath}; screenshot: ${diagnostic.screenshotPath}`);
+    }
 
     let token = ignoreInitialAccessToken ? '' : await extractAccessTokenFromPage(page);
     if (!token && !(await isAuthenticated(page))) {
@@ -2032,6 +2067,10 @@ async function runLogin(config = getConfig(), options = {}) {
         console.log(config.githubActions
           ? '[BBGU] Text QR is unavailable in GitHub Actions; local screenshot path will not be pushed.'
           : '[BBGU] PushPlus will send screenshot path only because text QR is unavailable.');
+      }
+      if (shouldAbortGithubQrLogin({ githubActions: config.githubActions, textQr, qrImageUrl })) {
+        const diagnostic = await saveLoginTimeoutDiagnostics(page, config);
+        throw new Error(`GitHub Actions could not extract a scannable QR code. Diagnostic report: ${diagnostic.reportPath}; screenshot: ${diagnostic.screenshotPath}`);
       }
       await sendPushPlus({
         token: config.pushplusToken,
@@ -2267,6 +2306,8 @@ module.exports = {
   renderTerminalQrCode,
   decodeQrPayloadFromPngFile,
   formatQrLoginMessage,
+  shouldAbortGithubQrLogin,
+  installPageRequestFailureCapture,
   saveLoginTimeoutDiagnostics,
   saveQrElementScreenshot,
   isLikelyQrLoginUrl,

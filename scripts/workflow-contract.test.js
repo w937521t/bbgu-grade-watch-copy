@@ -49,12 +49,19 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
 
   assert.match(yaml, /node-version: ['"]24['"]/);
   assert.match(yaml, /CLASH_SUBSCRIPTION_URL: \$\{\{ secrets\.CLASH_SUBSCRIPTION_URL \}\}/);
+  assert.match(yaml, /BBGU_PROXY_FILTER: \$\{\{ secrets\.BBGU_PROXY_FILTER \}\}/);
+  assert.match(yaml, /BBGU_PROXY_EXCLUDE: \$\{\{ secrets\.BBGU_PROXY_EXCLUDE \}\}/);
   assert.match(yaml, /docker\.io\/metacubex\/mihomo:Alpha/);
   assert.match(yaml, /proxy-providers:/);
   assert.match(yaml, /type: url-test/);
+  assert.match(yaml, /proxy_filter="\$\{BBGU_PROXY_FILTER:-\(\?i\)\(\^CN-\|中国\|国内\|上海\|深圳\|浙江\|内蒙古\|云南\|山东\|河南\|成都\|广东\)\}"/);
+  assert.match(yaml, /proxy_user_exclude="\$\{BBGU_PROXY_EXCLUDE:-\(\?i\)\(HK\|香港\|TW\|台湾\|JP\|日本\|US\|美国\|Netflix\)\}"/);
+  assert.match(yaml, /proxy_exclude="\$proxy_noise_exclude\|\$proxy_user_exclude"/);
+  assert.match(yaml, /filter: "\$proxy_filter"/);
+  assert.match(yaml, /exclude-filter: "\$proxy_exclude"/);
   assert.doesNotMatch(yaml, /filter: .*香港.*HK.*台湾.*TW.*日本.*JP/);
   assert.doesNotMatch(yaml, /等待可用的HK\/TW\/JP节点/);
-  assert.match(yaml, /exclude-filter: .*剩余.*流量.*到期.*官网.*套餐/);
+  assert.match(yaml, /proxy_noise_exclude="\(\?i\)\(剩余\|流量\|到期\|官网\|套餐\)"/);
   assert.match(yaml, /echo "\[BBGU\] 等待可用代理节点（\$attempt\/12）\.\.\."/);
   assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);

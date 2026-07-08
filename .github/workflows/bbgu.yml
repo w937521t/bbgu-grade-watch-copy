@@ -52,6 +52,8 @@ jobs:
       - name: 启动并验证Mihomo代理
         env:
           CLASH_SUBSCRIPTION_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
+          BBGU_PROXY_FILTER: ${{ secrets.BBGU_PROXY_FILTER }}
+          BBGU_PROXY_EXCLUDE: ${{ secrets.BBGU_PROXY_EXCLUDE }}
         run: |
           set -euo pipefail
           if [[ -z "${CLASH_SUBSCRIPTION_URL:-}" ]]; then
@@ -62,6 +64,12 @@ jobs:
           mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
           mkdir -p "$mihomo_dir/providers"
           subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
+          proxy_filter="${BBGU_PROXY_FILTER:-(?i)(^CN-|中国|国内|上海|深圳|浙江|内蒙古|云南|山东|河南|成都|广东)}"
+          proxy_user_exclude="${BBGU_PROXY_EXCLUDE:-(?i)(HK|香港|TW|台湾|JP|日本|US|美国|Netflix)}"
+          proxy_noise_exclude="(?i)(剩余|流量|到期|官网|套餐)"
+          proxy_exclude="$proxy_noise_exclude|$proxy_user_exclude"
+          echo "[BBGU] Mihomo节点过滤：filter=$proxy_filter"
+          echo "[BBGU] Mihomo节点排除：exclude=$proxy_exclude"
           cat > "$mihomo_dir/config.yaml" <<EOF
           mixed-port: 7890
           allow-lan: false
@@ -75,7 +83,8 @@ jobs:
               url: $subscription_json
               path: ./providers/airport.yaml
               interval: 3600
-              exclude-filter: "(?i)(剩余|流量|到期|官网|套餐)"
+              filter: "$proxy_filter"
+              exclude-filter: "$proxy_exclude"
               health-check:
                 enable: true
                 url: https://zhjw.bbgu.edu.cn/workspace/home

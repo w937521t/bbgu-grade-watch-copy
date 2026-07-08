@@ -132,6 +132,8 @@ bbgu-state.enc
 
 两次运行结束后都应看到加密状态成功推送到 `state` 分支。
 
+如需临时验证已出成绩是否能触发新增通知和平时分明细查询，可手动运行 `watch-reset`。该模式只删除本次 Runner 恢复出的 `bbgu_grade_snapshot.json`，不会删除 Token、Cookie 或浏览器登录态；随后按 `watch` 执行一次，并把现有成绩视为新增。
+
 ## 七、定时规则
 
 成绩查询：

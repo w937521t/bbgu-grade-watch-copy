@@ -8,7 +8,7 @@ on:
         required: true
         default: watch
         type: choice
-        options: [watch, renew, login]
+        options: [watch, renew, login, watch-reset]
   schedule:
     - cron: '0 10-22 * * *'
       timezone: Asia/Shanghai
@@ -164,6 +164,11 @@ jobs:
           case "$mode" in
             renew) node bbgu_grade_watch.js renew ;;
             login) node bbgu_grade_watch.js login ;;
+            watch-reset)
+              rm -f "$BBGU_DATA_DIR/bbgu_grade_snapshot.json"
+              echo '[BBGU] 已清空成绩快照，本次watch会把现有成绩视为新增。'
+              node bbgu_grade_watch.js
+              ;;
             watch) node bbgu_grade_watch.js ;;
             *) echo "未知模式：$mode" >&2; exit 2 ;;
           esac

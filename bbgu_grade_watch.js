@@ -554,6 +554,17 @@ function formatSubScoreText(row) {
     .join('；');
 }
 
+function formatSubScoreLines(row, indent = '') {
+  const subScores = Array.isArray(row && row.subScores) ? row.subScores : [];
+  if (!subScores.length) return [`${indent}- ${row && row.subScoreFetchError ? '读取失败' : '暂无保存记录'}`];
+  return subScores.map((item) => {
+    const name = clean(item.name) || '未命名项目';
+    const score = clean(item.score) || '-';
+    const weight = clean(item.weight);
+    return `${indent}- ${name}${weight ? `(${weight}%)` : ''}：${score}`;
+  });
+}
+
 function textDisplayWidth(value) {
   let width = 0;
   for (const char of String(value ?? '')) {
@@ -581,17 +592,24 @@ function padTextRight(value, width) {
   return text + ' '.repeat(Math.max(0, width - textDisplayWidth(text)));
 }
 
-function formatPlainGradeTable(rows) {
-  const widths = { course: 22, score: 6, credit: 6 };
-  const borderTop = `┌${'─'.repeat(widths.course)}┬${'─'.repeat(widths.score)}┬${'─'.repeat(widths.credit)}┐`;
-  const borderMid = `├${'─'.repeat(widths.course)}┼${'─'.repeat(widths.score)}┼${'─'.repeat(widths.credit)}┤`;
-  const borderBottom = `└${'─'.repeat(widths.course)}┴${'─'.repeat(widths.score)}┴${'─'.repeat(widths.credit)}┘`;
-  const rowLine = (course, score, credit) => `│${padTextRight(course, widths.course)}│${padTextRight(score, widths.score)}│${padTextRight(credit, widths.credit)}│`;
+function formatPlainGradeTable(rows, { includeGpa = false } = {}) {
+  const widths = includeGpa ? { course: 22, score: 6, credit: 6, gpa: 6 } : { course: 22, score: 6, credit: 6 };
+  const columns = includeGpa ? ['course', 'score', 'credit', 'gpa'] : ['course', 'score', 'credit'];
+  const joinBorder = (left, middle, right) => `${left}${columns.map((column) => '─'.repeat(widths[column])).join(middle)}${right}`;
+  const borderTop = joinBorder('┌', '┬', '┐');
+  const borderMid = joinBorder('├', '┼', '┤');
+  const borderBottom = joinBorder('└', '┴', '┘');
+  const rowLine = (values) => `│${columns.map((column) => padTextRight(values[column], widths[column])).join('│')}│`;
   return [
     borderTop,
-    rowLine('课程', '成绩', '学分'),
+    rowLine({ course: '课程', score: '成绩', credit: '学分', gpa: '绩点' }),
     borderMid,
-    ...rows.map((row) => rowLine(row.courseName || row.key || '未知课程', row.score || '-', row.credit || '-')),
+    ...rows.map((row) => rowLine({
+      course: row.courseName || row.key || '未知课程',
+      score: row.score || '-',
+      credit: row.credit || '-',
+      gpa: row.gpa || '-',
+    })),
     borderBottom,
   ].join('\n');
 }
@@ -615,21 +633,24 @@ function formatGradeNotification({ term, added, changed, currentRows, checkedAt 
 
   if (added?.length) {
     lines.push('', '新增成绩');
+    lines.push(formatPlainGradeTable(added, { includeGpa: true }));
+    lines.push('', '新增平时分明细');
     added.forEach((row, index) => {
       lines.push(`${index + 1}. ${row.courseName || row.key || '未知课程'}`);
-      lines.push(`   成绩：${row.score || '-'}｜学分：${row.credit || '-'}｜绩点：${row.gpa || '-'}`);
-      lines.push(`   平时分：${formatSubScoreText(row)}`);
+      lines.push(...formatSubScoreLines(row, '   '));
     });
   }
 
   if (changed?.length) {
     lines.push('', '变更成绩');
+    lines.push(formatPlainGradeTable(changed.map((item) => item.after || {}), { includeGpa: true }));
+    lines.push('', '变更平时分明细');
     changed.forEach((item, index) => {
       const before = item.before || {};
       const after = item.after || {};
       lines.push(`${index + 1}. ${after.courseName || after.key || '未知课程'}`);
       lines.push(`   成绩：${before.score || '空'} -> ${after.score || '空'}｜绩点：${before.gpa || '空'} -> ${after.gpa || '空'}`);
-      lines.push(`   平时分：${formatSubScoreText(after)}`);
+      lines.push(...formatSubScoreLines(after, '   '));
     });
   }
 
@@ -641,7 +662,8 @@ function formatGradeNotification({ term, added, changed, currentRows, checkedAt 
   const rowsWithSubScoreErrors = rows.filter((row) => row.subScoreFetchError && !(Array.isArray(row.subScores) && row.subScores.length));
   if (rowsWithSubScores.length || rowsWithSubScoreErrors.length) {
     for (const row of rowsWithSubScores) {
-      lines.push(`- ${row.courseName || row.key || '未知课程'}：${formatSubScoreText(row)}`);
+      lines.push(`- ${row.courseName || row.key || '未知课程'}`);
+      lines.push(...formatSubScoreLines(row, '  '));
     }
     for (const row of rowsWithSubScoreErrors) {
       lines.push(`- ${row.courseName || row.key || '未知课程'}：读取失败`);

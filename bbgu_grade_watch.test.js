@@ -297,10 +297,12 @@ test('formatGradeNotification produces compact plain text grade report', () => {
   assert.match(message, /检查时间：2026-07-02 18:10/);
   assert.match(message, /新增 1 门｜变更 0 门｜本学期已出 2 门/);
   assert.match(message, /本学期算术平均分：79\.00/);
-  assert.match(message, /┌/);
+  assert.match(message, /新增成绩\n┌/);
+  assert.match(message, /│课程\s+│成绩\s+│学分\s+│绩点\s+│/);
   assert.match(message, /流体力学与液压传动/);
-  assert.match(message, /平时分：平时成绩\(30%\) 80/);
-  assert.match(message, /期末成绩\(70%\) 50/);
+  assert.match(message, /平时分明细/);
+  assert.match(message, /- 平时成绩\(30%\)：80/);
+  assert.match(message, /- 期末成绩\(70%\)：50/);
   assert.doesNotMatch(message, /上学期课程/);
 });
 

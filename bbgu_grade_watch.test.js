@@ -12,6 +12,7 @@ const {
   normalizeSubScoreList,
   mergePersistedSubScores,
   selectRowsForSubScoreFetch,
+  enrichRowsWithSubScores,
   sendPushPlus,
   parseBooleanEnv,
   parsePositiveIntegerEnv,
@@ -541,6 +542,32 @@ test('selectRowsForSubScoreFetch only selects changed or added rows once', () =>
   });
 
   assert.deepEqual(rows.map((row) => row.key), ['A', 'D']);
+});
+
+test('enrichRowsWithSubScores logs available fields when added rows miss scoreId', async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (message) => logs.push(String(message));
+
+  try {
+    const result = await enrichRowsWithSubScores({
+      added: [{
+        key: '机械制造技术基础',
+        courseName: '机械制造技术基础',
+        score: '83',
+        sourceKeys: ['courseName', 'effectiveScoreShow', 'scoreFormId', 'detailId'],
+      }],
+      changed: [],
+    }, {}, async () => {
+      throw new Error('should not fetch without scoreId');
+    });
+
+    assert.deepEqual(result, { fetched: 0, failed: 0 });
+    assert.match(logs.join('\n'), /Subscore skipped for 机械制造技术基础: missing scoreId/);
+    assert.match(logs.join('\n'), /fields=courseName,detailId,effectiveScoreShow,scoreFormId/);
+  } finally {
+    console.log = originalLog;
+  }
 });
 
 test('buildAuthorizationHeader accepts full header, raw token, and JSON-stringified token', () => {

@@ -328,6 +328,7 @@ function normalizeGradeRows(rows) {
       key: courseCode ? `${courseCode}::${courseName || courseCode}` : courseName,
       courseName: courseName || courseCode,
       ...(scoreId ? { scoreId } : {}),
+      ...(!scoreId && Array.isArray(row.__bbguSourceKeys) ? { sourceKeys: row.__bbguSourceKeys.map(clean).filter(Boolean).sort() } : {}),
       score,
       credit,
       gpa,
@@ -361,6 +362,7 @@ function normalizeBbguScoreApiData(data, preferredTerm = '') {
         credit: item.courseCredit,
         gpa: item.gpa,
         term: firstNonEmpty(item.sessionName, termName),
+        __bbguSourceKeys: Object.keys(item || {}),
       });
     }
   }
@@ -513,6 +515,30 @@ function selectRowsForSubScoreFetch(diff) {
   }
 
   return selected;
+}
+
+function selectRowsMissingSubScoreIdForSubScoreFetch(diff) {
+  const selected = [];
+  const seen = new Set();
+  const candidates = [
+    ...((diff && diff.added) || []),
+    ...(((diff && diff.changed) || []).map((item) => item.after)),
+  ];
+
+  for (const row of candidates) {
+    if (!row || row.scoreId || hasSubScoreFetchRecord(row) || seen.has(row.key)) continue;
+    seen.add(row.key);
+    selected.push(row);
+  }
+
+  return selected;
+}
+
+function formatSubScoreSourceKeys(row) {
+  const keys = Array.isArray(row && row.sourceKeys) && row.sourceKeys.length
+    ? row.sourceKeys
+    : Object.keys(row || {}).filter((key) => !['subScores', 'subScoreFetchedAt', 'subScoreFetchError'].includes(key));
+  return keys.map(clean).filter(Boolean).sort().join(',');
 }
 
 function formatSubScoreText(row) {
@@ -1398,6 +1424,10 @@ async function fetchBbguSubScores(scoreId, config) {
 
 async function enrichRowsWithSubScores(diff, config, fetcher = fetchBbguSubScores) {
   const rowsToFetch = selectRowsForSubScoreFetch(diff);
+  const rowsMissingScoreId = selectRowsMissingSubScoreIdForSubScoreFetch(diff);
+  for (const row of rowsMissingScoreId) {
+    console.log(`[BBGU] Subscore skipped for ${row.courseName || row.key || 'unknown course'}: missing scoreId. fields=${formatSubScoreSourceKeys(row) || 'unknown'}`);
+  }
   if (!rowsToFetch.length) return { fetched: 0, failed: 0 };
 
   let fetched = 0;

@@ -494,6 +494,26 @@ test('normalizeBbguScoreApiData converts real BBGU score response shape', () => 
   ]);
 });
 
+test('normalizeBbguScoreApiData uses BBGU row id as subscore scoreId fallback', () => {
+  const rows = normalizeBbguScoreApiData({
+    '2026春': {
+      stuScoreHomePgVoS: [
+        {
+          id: 'raw-score-row-id',
+          courseName: '机械制造技术基础',
+          courseCode: 'M001',
+          courseCredit: '4.0',
+          effectiveScoreShow: '83',
+          sessionName: '2026春',
+        },
+      ],
+    },
+  });
+
+  assert.equal(rows[0].scoreId, 'raw-score-row-id');
+  assert.equal(rows[0].sourceKeys, undefined);
+});
+
 test('normalizeSubScoreList extracts score form subscore rows', () => {
   assert.deepEqual(normalizeSubScoreList({
     data: {

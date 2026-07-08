@@ -357,7 +357,7 @@ function normalizeBbguScoreApiData(data, preferredTerm = '') {
       rows.push({
         courseCode: item.courseCode,
         courseName: item.courseName,
-        scoreId: item.scoreId,
+        scoreId: firstNonEmpty(item.scoreId, item.score_id, item.id),
         score: firstNonEmpty(item.effectiveScoreShow, item.scoreShow, item.effectiveScore, item.score),
         credit: item.courseCredit,
         gpa: item.gpa,

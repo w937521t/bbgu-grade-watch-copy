@@ -1191,9 +1191,118 @@ function requestRefreshWithHttps(url, options) {
   });
 }
 
+function requestRefreshWithHttpsProxy(url, options, proxyServer) {
+  const target = new URL(url);
+  const proxy = new URL(proxyServer);
+  if (target.protocol !== 'https:') {
+    return Promise.reject(new Error(`Proxy refresh fallback only supports https URLs: ${target.protocol}`));
+  }
+  if (proxy.protocol !== 'http:') {
+    return Promise.reject(new Error(`Proxy refresh fallback only supports http proxy URLs: ${proxy.protocol}`));
+  }
+
+  return new Promise((resolve, reject) => {
+    const body = options.body || '';
+    const proxyPort = Number(proxy.port || 80);
+    const targetPort = Number(target.port || 443);
+    const targetHostPort = `${target.hostname}:${targetPort}`;
+    const proxyHost = proxy.hostname;
+    const proxyHeaders = [
+      `CONNECT ${targetHostPort} HTTP/1.1`,
+      `Host: ${targetHostPort}`,
+      'Proxy-Connection: keep-alive',
+    ];
+    if (proxy.username || proxy.password) {
+      const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64');
+      proxyHeaders.push(`Proxy-Authorization: Basic ${auth}`);
+    }
+
+    let settled = false;
+    let socket;
+    let connectBuffer = Buffer.alloc(0);
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      if (socket) socket.destroy();
+      reject(error);
+    };
+
+    socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
+      socket.write(`${proxyHeaders.join('\r\n')}\r\n\r\n`);
+    });
+    socket.setTimeout(options.timeoutMs, () => {
+      finishReject(new Error(`Proxy refresh CONNECT timeout after ${options.timeoutMs}ms`));
+    });
+    socket.on('error', (error) => finishReject(error));
+    socket.on('data', function onConnectData(chunk) {
+      connectBuffer = Buffer.concat([connectBuffer, chunk]);
+      const headerEnd = connectBuffer.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+
+      socket.off('data', onConnectData);
+      const headerText = connectBuffer.slice(0, headerEnd).toString('latin1');
+      const leftover = connectBuffer.slice(headerEnd + 4);
+      const statusMatch = headerText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/i);
+      const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+      if (statusCode !== 200) {
+        finishReject(new Error(`Proxy refresh CONNECT failed with status ${statusCode || 'unknown'}`));
+        return;
+      }
+      if (leftover.length) socket.unshift(leftover);
+
+      const secureSocket = tls.connect({
+        socket,
+        servername: target.hostname,
+        ALPNProtocols: ['http/1.1'],
+      }, () => {
+        const request = https.request({
+          protocol: 'https:',
+          hostname: target.hostname,
+          port: targetPort,
+          path: `${target.pathname}${target.search}`,
+          method: options.method || 'POST',
+          headers: {
+            ...options.headers,
+            'content-length': Buffer.byteLength(body),
+          },
+          timeout: options.timeoutMs,
+          agent: false,
+          createConnection: () => secureSocket,
+          insecureHTTPParser: true,
+        }, (response) => {
+          const chunks = [];
+          response.setEncoding('utf8');
+          response.on('data', (responseChunk) => chunks.push(responseChunk));
+          response.on('end', () => {
+            if (settled) return;
+            settled = true;
+            const status = response.statusCode || 0;
+            const text = chunks.join('');
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              text: async () => text,
+            });
+          });
+        });
+
+        request.on('timeout', () => {
+          request.destroy(new Error(`Proxy refresh HTTPS request timeout after ${options.timeoutMs}ms`));
+        });
+        request.on('error', (error) => finishReject(error));
+        request.write(body);
+        request.end();
+      });
+      secureSocket.on('error', (error) => finishReject(error));
+    });
+  });
+}
+
 async function requestRefreshedAuthState(config, current, deps = {}) {
   const fetchFn = deps.fetchFn || fetch;
   const httpsRequestFn = deps.httpsRequestFn || (!deps.fetchFn ? requestRefreshWithHttps : null);
+  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || (!deps.fetchFn ? requestRefreshWithHttpsProxy : null);
+  const proxyServer = clean(deps.proxyServer || (config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
   const timeoutMs = deps.timeoutMs || BBGU_REFRESH_TIMEOUT_MS;
   if (!current || !current.refreshToken) {
     const error = new Error('No saved BBGU refresh token.');
@@ -1222,15 +1331,21 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
     try {
       response = await fetchFn(url, options);
     } catch (error) {
-      if (!httpsRequestFn) throw error;
+      if (!httpsRequestFn && !(proxyServer && proxyHttpsRequestFn)) throw error;
       const cause = error && error.cause ? error.cause : error;
-      console.log(`[BBGU] Refresh内置请求失败，改用原生HTTPS。原因：${cause && (cause.code || cause.message)}`);
-      response = await httpsRequestFn(url, {
+      const fallbackOptions = {
         method: options.method,
         headers: options.headers,
         body,
         timeoutMs,
-      });
+      };
+      if (proxyServer && proxyHttpsRequestFn) {
+        console.log(`[BBGU] Refresh内置请求失败，改用代理HTTPS。原因：${cause && (cause.code || cause.message)}`);
+        response = await proxyHttpsRequestFn(url, fallbackOptions, proxyServer);
+      } else {
+        console.log(`[BBGU] Refresh内置请求失败，改用原生HTTPS。原因：${cause && (cause.code || cause.message)}`);
+        response = await httpsRequestFn(url, fallbackOptions);
+      }
     }
     const text = await response.text();
     let payload;
@@ -1302,6 +1417,7 @@ async function collectCasDiagnosticSnapshot(config) {
 
 function isAuthExpiredResponse({ httpStatus, text, body }) {
   if (httpStatus === 401 || httpStatus === 403) return true;
+  if (httpStatus >= 500) return false;
   if (/统一身份认证|扫码登录|cas|login/i.test(text || '')) return true;
   if (!body || typeof body !== 'object') return false;
   const status = clean(body.status).toLowerCase();
@@ -1313,6 +1429,12 @@ function isAuthExpiredResponse({ httpStatus, text, body }) {
     return /token|auth|login|登录|认证|过期|失效|未授权|unauthorized|expired/i.test(msg) || httpStatus !== 200;
   }
   return false;
+}
+
+function isTerminalRefreshAuthFailure(error) {
+  if (error && error.code === 'BBGU_REFRESH_UNAVAILABLE') return true;
+  const httpStatus = Number(error && error.httpStatus);
+  return httpStatus === 400 || httpStatus === 401 || httpStatus === 403;
 }
 
 async function notifyAuthExpiredOnce(config, reason) {
@@ -2048,7 +2170,6 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
   const {
     nowFn = Date.now,
     refreshAndSaveAuthStateFn = refreshAndSaveAuthState,
-    runSilentRenewFn = runSilentRenew,
     runLoginFn = runLogin,
     readQrReminderStateFn = readQrReminderState,
     readSavedAuthStateFn = readSavedAuthState,
@@ -2067,53 +2188,29 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
     return fetchScoreRowsFn(config);
   } catch (error) {
     console.log(`[BBGU] Refresh Token续Access失败。原因：${error.message || error}`);
+    if (!isTerminalRefreshAuthFailure(error)) {
+      throw error;
+    }
   }
 
   let renewalState = await readQrReminderStateFn(config);
-  if (renewalState && (renewalState.casExpired || Number.isFinite(renewalState.dueAt))) {
-    if (!Number.isFinite(renewalState.dueAt)) {
-      const auth = await readSavedAuthStateFn(config.tokenPath);
-      const expiry = extractJwtExpiry(auth.accessToken);
-      if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
-      renewalState = await saveQrReminderScheduleFn(
-        config,
-        computeQrSchedule(expiry.epochSeconds, nowFn())
-      );
-    }
-    const qrResult = await maybeRunScheduledQrFn(config, { nowFn, runLoginFn });
-    if (!qrResult || qrResult.status !== 'login_ok') {
-      throw new Error('二维码提醒仍在冷却期，本次成绩查询无法登录。');
-    }
-    const savedToken = await readSavedAccessTokenFn(config.tokenPath);
-    if (!savedToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
-    config.authorization = buildAuthorizationHeader('', savedToken);
-    return fetchScoreRowsFn(config);
+  if (!renewalState || !Number.isFinite(renewalState.dueAt)) {
+    const auth = await readSavedAuthStateFn(config.tokenPath);
+    const expiry = extractJwtExpiry(auth.accessToken);
+    if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
+    renewalState = await saveQrReminderScheduleFn(
+      config,
+      computeQrSchedule(expiry.epochSeconds, nowFn())
+    );
   }
 
-  if (config.silentRenewOnExpired) {
-    try {
-      console.log('[BBGU] Refresh不可用，尝试CAS静默续期。');
-      await runSilentRenewFn(config);
-      const savedToken = await readSavedAccessTokenFn(config.tokenPath);
-      if (!savedToken) {
-        throw new Error(`Silent CAS renew completed but no token was saved at ${config.tokenPath}.`);
-      }
-      config.authorization = buildAuthorizationHeader('', savedToken);
-      console.log('[BBGU] Silent CAS renewal completed; retrying score API.');
-      return fetchScoreRowsFn(config);
-    } catch (error) {
-      console.log(`[BBGU] Silent CAS renewal failed; falling back to QR login. reason=${error.message || error}`);
-    }
+  const qrResult = await maybeRunScheduledQrFn(config, { nowFn, runLoginFn });
+  if (!qrResult || qrResult.status !== 'login_ok') {
+    throw new Error('二维码提醒仍在冷却期，本次成绩查询无法登录。');
   }
-
-  console.log('[BBGU] Starting automatic QR login renewal.');
-  await runLoginFn(config, { ignoreInitialAccessToken: true });
   const savedToken = await readSavedAccessTokenFn(config.tokenPath);
-  if (!savedToken) {
-    throw new Error(`Automatic login completed but no token was saved at ${config.tokenPath}.`);
-  }
+  if (!savedToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
   config.authorization = buildAuthorizationHeader('', savedToken);
-  console.log('[BBGU] Automatic login renewal completed; retrying score API.');
   return fetchScoreRowsFn(config);
 }
 
@@ -2355,6 +2452,10 @@ async function runRenew(config = getConfig(), deps = {}) {
     }));
     return { status: 'refresh_ok' };
   } catch (refreshError) {
+    if (!isTerminalRefreshAuthFailure(refreshError)) {
+      console.log(`[BBGU] Refresh Token续Access临时失败，本次不安排二维码。原因：${refreshError.message || refreshError}`);
+      throw refreshError;
+    }
     console.log(`[BBGU] Refresh Token失效，根据最后一枚Access的过期时间安排二维码。原因：${refreshError.message || refreshError}`);
   }
 

@@ -649,6 +649,7 @@ test('isAuthExpiredResponse detects expired token responses', () => {
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '<html>统一身份认证</html>', body: null }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"fail"}', body: { status: 'fail', msg: 'token expired' } }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"success"}', body: { status: 'success', ok: true } }), false);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 502, text: '{"ok":false,"msg":"bad gateway"}', body: { ok: false, msg: 'bad gateway' } }), false);
 });
 
 test('formatAuthExpiredMessage explains how to renew BBGU_ACCESS_TOKEN', () => {
@@ -1018,89 +1019,44 @@ test('recoverDirectApiAfterAuthExpired stops after successful refresh token rene
   assert.deepEqual(rows, [{ courseName: '人工智能', score: '100' }]);
 });
 
-test('recoverDirectApiAfterAuthExpired tries silent renew after refresh fails', async () => {
+test('recoverDirectApiAfterAuthExpired schedules QR from last access expiry after refresh fails', async () => {
   const calls = [];
+  const nowMs = Date.parse('2026-07-04T15:30:00+08:00');
   const config = {
     autoLoginOnExpired: true,
     silentRenewOnExpired: true,
     tokenPath: 'token.env',
   };
 
-  const rows = await recoverDirectApiAfterAuthExpired(config, {
-    refreshAndSaveAuthStateFn: async () => {
-      calls.push('refresh');
-      throw new Error('refresh expired');
-    },
-    runSilentRenewFn: async () => {
-      calls.push('silent');
-    },
-    runLoginFn: async () => {
-      calls.push('qr');
-    },
-    readSavedAccessTokenFn: async () => 'new.access.token',
-    fetchScoreRowsFn: async (nextConfig) => {
-      calls.push(nextConfig.authorization);
-      return [{ courseName: '人工智能', score: '100' }];
-    },
-  });
+  await assert.rejects(
+    recoverDirectApiAfterAuthExpired(config, {
+      nowFn: () => nowMs,
+      refreshAndSaveAuthStateFn: async () => {
+        calls.push('refresh');
+        const error = new Error('refresh expired');
+        error.httpStatus = 401;
+        throw error;
+      },
+      readQrReminderStateFn: async () => null,
+      readSavedAuthStateFn: async () => ({
+        accessToken: makeJwt({ exp: Date.parse('2026-07-04T17:34:00+08:00') / 1000 }),
+        refreshToken: '',
+      }),
+      saveQrReminderScheduleFn: async (_config, schedule) => {
+        calls.push(`schedule:${new Date(schedule.dueAt).toISOString()}`);
+        return schedule;
+      },
+      maybeRunScheduledQrFn: async () => {
+        calls.push('scheduled-qr');
+        return { status: 'qr_pending' };
+      },
+      runSilentRenewFn: async () => calls.push('silent'),
+      runLoginFn: async () => calls.push('direct-qr'),
+    }),
+    /二维码提醒仍在冷却期/
+  );
 
-  assert.deepEqual(calls, ['refresh', 'silent', 'Bearer new.access.token']);
-  assert.deepEqual(rows, [{ courseName: '人工智能', score: '100' }]);
-});
-
-test('recoverDirectApiAfterAuthExpired falls back to QR login when silent renew fails', async () => {
-  const calls = [];
-  const config = {
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: true,
-    tokenPath: 'token.env',
-  };
-
-  await recoverDirectApiAfterAuthExpired(config, {
-    refreshAndSaveAuthStateFn: async () => {
-      calls.push('refresh');
-      throw new Error('refresh expired');
-    },
-    runSilentRenewFn: async () => {
-      calls.push('silent');
-      throw new Error('CAS expired');
-    },
-    runLoginFn: async () => {
-      calls.push('qr');
-    },
-    readSavedAccessTokenFn: async () => 'qr.access.token',
-    fetchScoreRowsFn: async (nextConfig) => {
-      calls.push(nextConfig.authorization);
-      return [];
-    },
-  });
-
-  assert.deepEqual(calls, ['refresh', 'silent', 'qr', 'Bearer qr.access.token']);
-});
-
-test('recoverDirectApiAfterAuthExpired skips CAS when silent renewal is disabled', async () => {
-  const calls = [];
-  const config = {
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: false,
-    tokenPath: 'token.env',
-  };
-
-  await recoverDirectApiAfterAuthExpired(config, {
-    refreshAndSaveAuthStateFn: async () => {
-      calls.push('refresh');
-      throw new Error('refresh expired');
-    },
-    runSilentRenewFn: async () => calls.push('silent'),
-    runLoginFn: async () => calls.push('qr'),
-    readSavedAccessTokenFn: async () => 'qr.access.token',
-    fetchScoreRowsFn: async (nextConfig) => {
-      calls.push(nextConfig.authorization);
-      return [];
-    },
-  });
-
-  assert.deepEqual(calls, ['refresh', 'qr', 'Bearer qr.access.token']);
+  assert.deepEqual(calls, ['refresh', 'schedule:2026-07-04T09:00:00.000Z', 'scheduled-qr']);
 });
 
 test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', async () => {
@@ -1115,7 +1071,9 @@ test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', as
     recoverDirectApiAfterAuthExpired(config, {
       refreshAndSaveAuthStateFn: async () => {
         calls.push('refresh');
-        throw new Error('Refresh已失效');
+        const error = new Error('Refresh已失效');
+        error.httpStatus = 401;
+        throw error;
       },
       readQrReminderStateFn: async () => ({
         dueAt: Date.parse('2026-07-04T17:00:00+08:00'),
@@ -1266,7 +1224,12 @@ test('CAS和Refresh都失效后renew根据最后一枚Access安排扫码', async
     nowFn: () => Date.parse('2026-07-04T15:30:00+08:00'),
     readQrReminderStateFn: async () => ({ casExpired: true }),
     runSilentRenewFn: async () => calls.push('cas'),
-    refreshAndSaveAuthStateFn: async () => { calls.push('refresh'); throw new Error('Refresh已失效'); },
+    refreshAndSaveAuthStateFn: async () => {
+      calls.push('refresh');
+      const error = new Error('Refresh已失效');
+      error.httpStatus = 401;
+      throw error;
+    },
     readSavedAuthStateFn: async () => ({
       accessToken: makeJwt({ exp: Date.parse('2026-07-04T17:34:00+08:00') / 1000 }),
       refreshToken: '',
@@ -1284,6 +1247,35 @@ test('CAS和Refresh都失效后renew根据最后一枚Access安排扫码', async
   assert.match(logs.join('\n'), /CAS：已失效，本次已跳过/);
   assert.match(logs.join('\n'), /Refresh Token：已失效/);
   assert.match(logs.join('\n'), /Access Token：有效/);
+});
+
+test('renew遇到Refresh服务器故障时不安排二维码', async () => {
+  const calls = [];
+  const error = new Error('authserver bad gateway');
+  error.httpStatus = 502;
+
+  await assert.rejects(
+    runRenew({ autoLoginOnExpired: true, tokenPath: 'token.env' }, {
+      readQrReminderStateFn: async () => ({ casExpired: true }),
+      refreshAndSaveAuthStateFn: async () => {
+        calls.push('refresh');
+        throw error;
+      },
+      readSavedAuthStateFn: async () => {
+        calls.push('read-token');
+        return {
+          accessToken: makeJwt({ exp: Date.parse('2026-07-04T17:34:00+08:00') / 1000 }),
+          refreshToken: '',
+        };
+      },
+      saveQrReminderScheduleFn: async () => calls.push('schedule'),
+      maybeRunScheduledQrFn: async () => calls.push('check-qr'),
+      logFn: () => undefined,
+    }),
+    /authserver bad gateway/
+  );
+
+  assert.deepEqual(calls, ['refresh']);
 });
 
 test('clearBrowserAccessTokens removes saved CQU access token keys', async () => {
@@ -1397,10 +1389,13 @@ test('requestRefreshedAuthState posts verified form and keeps old refresh token 
   assert.equal(calls[0].options.headers['content-type'], 'application/x-www-form-urlencoded');
 });
 
-test('Refresh内置请求失败后改用原生HTTPS后备路径', async () => {
+test('Refresh内置请求失败后优先通过Mihomo代理HTTPS后备路径', async () => {
   const calls = [];
   const result = await requestRefreshedAuthState(
-    { homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home' },
+    {
+      homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+      proxyServer: 'http://127.0.0.1:7890',
+    },
     { accessToken: 'access.old.token', refreshToken: 'refresh.old.token' },
     {
       fetchFn: async () => {
@@ -1408,8 +1403,8 @@ test('Refresh内置请求失败后改用原生HTTPS后备路径', async () => {
         error.cause = { code: 'UND_ERR_CONNECT_TIMEOUT' };
         throw error;
       },
-      httpsRequestFn: async (url, options) => {
-        calls.push({ url, options });
+      proxyHttpsRequestFn: async (url, options, proxyServer) => {
+        calls.push({ url, options, proxyServer });
         return {
           ok: true,
           status: 200,
@@ -1424,6 +1419,7 @@ test('Refresh内置请求失败后改用原生HTTPS后备路径', async () => {
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://zhjw.bbgu.edu.cn/authserver/oauth/token');
+  assert.equal(calls[0].proxyServer, 'http://127.0.0.1:7890');
   assert.match(calls[0].options.body, /grant_type=refresh_token/);
   assert.equal(result.accessToken, 'access.new.token');
   assert.equal(result.refreshToken, 'refresh.new.token');

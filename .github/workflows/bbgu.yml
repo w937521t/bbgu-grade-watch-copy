@@ -49,81 +49,6 @@ jobs:
       - name: 安装Chromium
         run: npx playwright install --with-deps chromium
 
-      - name: 启动并验证Mihomo代理
-        env:
-          CLASH_SUBSCRIPTION_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
-          BBGU_PROXY_FILTER: ${{ secrets.BBGU_PROXY_FILTER }}
-          BBGU_PROXY_EXCLUDE: ${{ secrets.BBGU_PROXY_EXCLUDE }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${CLASH_SUBSCRIPTION_URL:-}" ]]; then
-            echo '[BBGU] 缺少CLASH_SUBSCRIPTION_URL Secret。' >&2
-            exit 1
-          fi
-
-          mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
-          mkdir -p "$mihomo_dir/providers"
-          subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
-          proxy_filter="${BBGU_PROXY_FILTER:-(?i)(^CN-|中国|国内|上海|深圳|浙江|内蒙古|云南|山东|河南|成都|广东)}"
-          proxy_user_exclude="${BBGU_PROXY_EXCLUDE:-(?i)(HK|香港|TW|台湾|JP|日本|US|美国|Netflix)}"
-          proxy_noise_exclude="(?i)(剩余|流量|到期|官网|套餐)"
-          proxy_exclude="$proxy_noise_exclude|$proxy_user_exclude"
-          echo "[BBGU] Mihomo节点过滤：filter=$proxy_filter"
-          echo "[BBGU] Mihomo节点排除：exclude=$proxy_exclude"
-          cat > "$mihomo_dir/config.yaml" <<EOF
-          mixed-port: 7890
-          allow-lan: false
-          bind-address: 127.0.0.1
-          mode: rule
-          log-level: info
-          ipv6: false
-          proxy-providers:
-            airport:
-              type: http
-              url: $subscription_json
-              path: ./providers/airport.yaml
-              interval: 3600
-              filter: "$proxy_filter"
-              exclude-filter: "$proxy_exclude"
-              health-check:
-                enable: true
-                url: https://zhjw.bbgu.edu.cn/workspace/home
-                interval: 300
-                timeout: 10000
-                lazy: false
-          proxy-groups:
-            - name: BBGU-AUTO
-              type: url-test
-              use: [airport]
-              url: https://zhjw.bbgu.edu.cn/workspace/home
-              interval: 300
-              timeout: 10000
-              lazy: false
-          rules:
-            - MATCH,BBGU-AUTO
-          EOF
-
-          docker pull docker.io/metacubex/mihomo:Alpha
-          docker run -d --name bbgu-mihomo --network host \
-            -v "$mihomo_dir:/root/.config/mihomo" \
-            docker.io/metacubex/mihomo:Alpha >/dev/null
-
-          for attempt in {1..12}; do
-            if result="$(curl -f -L --proxy http://127.0.0.1:7890 \
-              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
-              --connect-timeout 5 --max-time 10 -o /dev/null -sS \
-              -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s' \
-              https://zhjw.bbgu.edu.cn/workspace/home 2>/dev/null)"; then
-              echo "[BBGU] Mihomo代理可用：$result"
-              exit 0
-            fi
-            echo "[BBGU] 等待可用代理节点（$attempt/12）..."
-            sleep 5
-          done
-
-          echo '[BBGU] 所有候选代理节点均无法访问教务系统。' >&2
-          exit 1
-
       - name: 恢复加密状态
         env:
           BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
@@ -139,6 +64,135 @@ jobs:
           else
             echo '[BBGU] 未发现state分支，首次运行请选择login。'
           fi
+
+      - name: 启动并验证Mihomo代理
+        env:
+          CLASH_SUBSCRIPTION_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
+          BBGU_PROXY_FILTER: ${{ secrets.BBGU_PROXY_FILTER }}
+          BBGU_PROXY_EXCLUDE: ${{ secrets.BBGU_PROXY_EXCLUDE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLASH_SUBSCRIPTION_URL:-}" ]]; then
+            echo '[BBGU] 缺少CLASH_SUBSCRIPTION_URL Secret。' >&2
+            exit 1
+          fi
+
+          mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
+          mkdir -p "$mihomo_dir/providers"
+          mihomo_controller="http://127.0.0.1:9090"
+          proxy_group="BBGU-STICKY"
+          proxy_state_path="$BBGU_DATA_DIR/bbgu_proxy_state.json"
+          subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
+          proxy_filter="${BBGU_PROXY_FILTER:-(?i)(^CN-|中国|国内|上海|深圳|浙江|内蒙古|云南|山东|河南|成都|广东)}"
+          proxy_user_exclude="${BBGU_PROXY_EXCLUDE:-(?i)(HK|香港|TW|台湾|JP|日本|US|美国|Netflix)}"
+          proxy_noise_exclude="(?i)(剩余|流量|到期|官网|套餐)"
+          proxy_exclude="$proxy_noise_exclude|$proxy_user_exclude"
+          echo "[BBGU] Mihomo节点过滤：filter=$proxy_filter"
+          echo "[BBGU] Mihomo节点排除：exclude=$proxy_exclude"
+          cat > "$mihomo_dir/config.yaml" <<EOF
+          mixed-port: 7890
+          allow-lan: false
+          bind-address: 127.0.0.1
+          mode: rule
+          log-level: info
+          ipv6: false
+          external-controller: 127.0.0.1:9090
+          proxy-providers:
+            airport:
+              type: http
+              url: $subscription_json
+              path: ./providers/airport.yaml
+              interval: 3600
+              filter: "$proxy_filter"
+              exclude-filter: "$proxy_exclude"
+              health-check:
+                enable: true
+                url: https://zhjw.bbgu.edu.cn/workspace/home
+                interval: 300
+                timeout: 10000
+                lazy: false
+          proxy-groups:
+            - name: BBGU-STICKY
+              type: select
+              use: [airport]
+          rules:
+            - MATCH,BBGU-STICKY
+          EOF
+
+          docker pull docker.io/metacubex/mihomo:Alpha
+          docker run -d --name bbgu-mihomo --network host \
+            -v "$mihomo_dir:/root/.config/mihomo" \
+            docker.io/metacubex/mihomo:Alpha >/dev/null
+
+          for attempt in {1..12}; do
+            if curl -fsS "$mihomo_controller/proxies/$proxy_group" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" == "12" ]]; then
+              echo '[BBGU] Mihomo控制接口不可用。' >&2
+              exit 1
+            fi
+            echo "[BBGU] 等待Mihomo控制接口（$attempt/12）..."
+            sleep 5
+          done
+
+          set_group_proxy() {
+            local name="$1"
+            local body
+            body="$(node -e 'process.stdout.write(JSON.stringify({name: process.argv[1]}))' "$name")"
+            curl -fsS -X PUT "$mihomo_controller/proxies/$proxy_group" \
+              -H 'Content-Type: application/json' \
+              --data "$body" >/dev/null
+          }
+
+          test_bbgu_proxy() {
+            curl -f -L --proxy http://127.0.0.1:7890 \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
+              --connect-timeout 5 --max-time 10 -o /dev/null -sS \
+              -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s' \
+              https://zhjw.bbgu.edu.cn/workspace/home
+          }
+
+          save_sticky_proxy() {
+            local name="$1"
+            mkdir -p "$BBGU_DATA_DIR"
+            node -e 'const fs = require("fs"); fs.writeFileSync(process.argv[1], `${JSON.stringify({ selectedProxy: process.argv[2], updatedAt: new Date().toISOString() }, null, 2)}\n`);' "$proxy_state_path" "$name"
+            echo "[BBGU] 保存粘性节点：$name"
+          }
+
+          saved_proxy=""
+          if [[ -f "$proxy_state_path" ]]; then
+            saved_proxy="$(node -e 'try { const state = require(process.argv[1]); process.stdout.write(String(state.selectedProxy || "")); } catch {}' "$proxy_state_path")"
+          fi
+
+          if [[ -n "$saved_proxy" ]]; then
+            echo "[BBGU] 沿用上次可用节点：$saved_proxy"
+            if set_group_proxy "$saved_proxy" && result="$(test_bbgu_proxy 2>/dev/null)"; then
+              echo "[BBGU] Mihomo粘性节点可用：$saved_proxy $result"
+              exit 0
+            fi
+            echo "[BBGU] 上次粘性节点不可用，准备切换国内候选节点：$saved_proxy"
+          fi
+
+          candidates="$(curl -fsS "$mihomo_controller/proxies/$proxy_group" | node -e 'let text = ""; process.stdin.on("data", (chunk) => { text += chunk; }); process.stdin.on("end", () => { const data = JSON.parse(text); for (const name of data.all || []) console.log(name); });')"
+          if [[ -z "$candidates" ]]; then
+            echo '[BBGU] Mihomo没有返回候选节点。' >&2
+            exit 1
+          fi
+
+          while IFS= read -r candidate; do
+            [[ -z "$candidate" ]] && continue
+            [[ "$candidate" == "$saved_proxy" ]] && continue
+            echo "[BBGU] 测试候选节点：$candidate"
+            if set_group_proxy "$candidate" && result="$(test_bbgu_proxy 2>/dev/null)"; then
+              save_sticky_proxy "$candidate"
+              echo "[BBGU] Mihomo代理可用：$candidate $result"
+              exit 0
+            fi
+          done <<< "$candidates"
+
+          echo '[BBGU] 所有候选代理节点均无法访问教务系统。' >&2
+          exit 1
 
       - name: 执行BBGU任务
         id: run_bbgu
@@ -194,6 +248,7 @@ jobs:
             bbgu_grade_snapshot.json
             bbgu_auth_expired_state.json
             bbgu_qr_reminder_state.json
+            bbgu_proxy_state.json
           )
           files=()
           for name in "${names[@]}"; do

@@ -16,6 +16,7 @@ test('Workflow保持青龙定时并使用加密状态分支', () => {
   assert.match(yaml, /PUSHPLUS_TOKEN: \$\{\{ secrets\.PUSHPLUS_TOKEN \}\}/);
   assert.match(yaml, /BBGU_STATE_PASSWORD: \$\{\{ secrets\.BBGU_STATE_PASSWORD \}\}/);
   assert.match(yaml, /bbgu-state\.enc/);
+  assert.match(yaml, /bbgu_proxy_state\.json/);
   assert.match(yaml, /node bbgu_grade_watch\.js renew/);
   assert.match(yaml, /node bbgu_grade_watch\.js login/);
   assert.match(yaml, /watch-reset\)\s+rm -f "\$BBGU_DATA_DIR\/bbgu_grade_snapshot\.json"/);
@@ -58,7 +59,14 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /BBGU_PROXY_EXCLUDE: \$\{\{ secrets\.BBGU_PROXY_EXCLUDE \}\}/);
   assert.match(yaml, /docker\.io\/metacubex\/mihomo:Alpha/);
   assert.match(yaml, /proxy-providers:/);
-  assert.match(yaml, /type: url-test/);
+  assert.match(yaml, /external-controller: 127\.0\.0\.1:9090/);
+  assert.match(yaml, /name: BBGU-STICKY/);
+  assert.match(yaml, /type: select/);
+  assert.doesNotMatch(yaml, /type: url-test/);
+  assert.match(yaml, /selectedProxy/);
+  assert.match(yaml, /PUT "\$mihomo_controller\/proxies\/\$proxy_group"/);
+  assert.match(yaml, /沿用上次可用节点/);
+  assert.match(yaml, /保存粘性节点/);
   assert.match(yaml, /proxy_filter="\$\{BBGU_PROXY_FILTER:-\(\?i\)\(\^CN-\|中国\|国内\|上海\|深圳\|浙江\|内蒙古\|云南\|山东\|河南\|成都\|广东\)\}"/);
   assert.match(yaml, /proxy_user_exclude="\$\{BBGU_PROXY_EXCLUDE:-\(\?i\)\(HK\|香港\|TW\|台湾\|JP\|日本\|US\|美国\|Netflix\)\}"/);
   assert.match(yaml, /proxy_exclude="\$proxy_noise_exclude\|\$proxy_user_exclude"/);
@@ -67,12 +75,23 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.doesNotMatch(yaml, /filter: .*香港.*HK.*台湾.*TW.*日本.*JP/);
   assert.doesNotMatch(yaml, /等待可用的HK\/TW\/JP节点/);
   assert.match(yaml, /proxy_noise_exclude="\(\?i\)\(剩余\|流量\|到期\|官网\|套餐\)"/);
-  assert.match(yaml, /echo "\[BBGU\] 等待可用代理节点（\$attempt\/12）\.\.\."/);
+  assert.match(yaml, /echo "\[BBGU\] 等待Mihomo控制接口（\$attempt\/12）\.\.\."/);
+  assert.match(yaml, /echo "\[BBGU\] 测试候选节点：\$candidate"/);
   assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);
   assert.match(yaml, /BBGU_PROXY_SERVER: http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NO_PROXY: .*pushplus/);
   assert.match(yaml, /docker rm -f bbgu-mihomo/);
+});
+
+test('Workflow在启动Mihomo前恢复状态以沿用上次粘性节点', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+  const restoreIndex = yaml.indexOf('- name: 恢复加密状态');
+  const mihomoIndex = yaml.indexOf('- name: 启动并验证Mihomo代理');
+
+  assert.notEqual(restoreIndex, -1);
+  assert.notEqual(mihomoIndex, -1);
+  assert.ok(restoreIndex < mihomoIndex);
 });
 
 test('Workflow用浏览器式GET验证代理并在主任务失败时输出Mihomo日志', () => {

@@ -1103,7 +1103,7 @@ test('recoverDirectApiAfterAuthExpired skips CAS when silent renewal is disabled
   assert.deepEqual(calls, ['refresh', 'qr', 'Bearer qr.access.token']);
 });
 
-test('CAS已失效时普通查询遵守二维码冷却并跳过CAS', async () => {
+test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', async () => {
   const calls = [];
   const config = {
     autoLoginOnExpired: true,
@@ -1118,7 +1118,6 @@ test('CAS已失效时普通查询遵守二维码冷却并跳过CAS', async () =>
         throw new Error('Refresh已失效');
       },
       readQrReminderStateFn: async () => ({
-        casExpired: true,
         dueAt: Date.parse('2026-07-04T17:00:00+08:00'),
         lastPushedAt: Date.parse('2026-07-04T17:00:00+08:00'),
       }),

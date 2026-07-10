@@ -2070,7 +2070,7 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
   }
 
   let renewalState = await readQrReminderStateFn(config);
-  if (renewalState && renewalState.casExpired) {
+  if (renewalState && (renewalState.casExpired || Number.isFinite(renewalState.dueAt))) {
     if (!Number.isFinite(renewalState.dueAt)) {
       const auth = await readSavedAuthStateFn(config.tokenPath);
       const expiry = extractJwtExpiry(auth.accessToken);

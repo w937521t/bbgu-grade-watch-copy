@@ -15,7 +15,7 @@
    - `package.json`
    - `package-lock.json`
    - `.gitignore`
-3. 不要上传 Token、Cookie、`bbgu-data`、二维码图片或青龙运行状态文件。
+3. 不要上传 Token、Cookie、`bbgu-data`、二维码图片或 Actions 运行状态文件。
 
 ## 二、配置 Secrets
 
@@ -171,7 +171,7 @@ GitHub 托管 Runner 与教务系统之间的 TLS 链路不可用，因此 Workf
 2. 默认只选择名称匹配 `CN-`、中国、国内或常见国内省市关键词的节点。
 3. 默认排除 HK、TW、JP、US、Netflix 等境外或流媒体节点。
 4. 自动测试国内候选节点能否访问教务系统。
-5. 选择可用且响应较快的节点。
+5. 优先沿用上次可用节点；不可用时切换到第一个可访问教务系统的国内候选节点。
 6. 让 Playwright、成绩接口和 Token 刷新请求通过本地 Mihomo 代理。
 
 GitHub状态提交和PushPlus保持直连。Workflow不会关闭HTTPS证书验证，也不会安装机场提供的CA。机场可以看到访问目标和流量元数据，但在正常TLS连接下不能读取Token或Cookie内容。

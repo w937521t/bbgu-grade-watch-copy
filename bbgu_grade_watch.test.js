@@ -24,13 +24,9 @@ const {
   formatAuthStatusSummary,
   computeQrSchedule,
   shouldPushQrNow,
-  summarizeCasCookies,
-  formatCasDiagnostics,
   buildCasRenewUrl,
   isRecoverableNavigationAbort,
   isAuthExpiredResponse,
-  formatAuthExpiredMessage,
-  parseSavedAccessToken,
   parseSavedAuthState,
   extractAuthStateFromStorageState,
   readSavedAuthState,
@@ -55,8 +51,6 @@ const {
   launchChromium,
   getConfig,
   isLikelyQrLoginUrl,
-  extractLoginDebugUrlsFromHtml,
-  classifyLoginDebugUrls,
   extractWeixinQrInfoFromHtml,
   extractWeixinQrConnectUrlFromHtml,
   recoverDirectApiAfterAuthExpired,
@@ -194,6 +188,11 @@ test('module exports only supported public helpers and no legacy browser scrapin
     'imageUrlToDataUrl',
     'limitInlineDataUrl',
     'extractQrLoginUrlFromPage',
+    'saveAccessToken',
+    'readSavedAccessToken',
+    'parseSavedAccessToken',
+    'formatAuthExpiredMessage',
+    'formatNoChangeMessage',
   ]) {
     assert.equal(Object.hasOwn(bbguGradeWatch, name), false, `${name} should not be exported`);
   }
@@ -201,18 +200,18 @@ test('module exports only supported public helpers and no legacy browser scrapin
 
 test('normalizeGradeRows keeps meaningful grade fields and ignores empty rows', () => {
   const rows = normalizeGradeRows([
-    { courseName: ' 高等数学 ', score: ' 95 ', credit: '4', gpa: '4.0', term: '2026春' },
-    { courseName: '', score: '', credit: '', gpa: '', term: '' },
+    { courseName: ' 高等数学 ', score: ' 95 ', credit: '4', term: '2026春' },
+    { courseName: '', score: '', credit: '', term: '' },
   ]);
 
   assert.deepEqual(rows, [
-    { key: '高等数学', courseName: '高等数学', score: '95', credit: '4', gpa: '4.0', term: '2026春' },
+    { key: '高等数学', courseName: '高等数学', score: '95', credit: '4', term: '2026春' },
   ]);
 });
 
 test('normalizeGradeRows builds stable keys with course code when present', () => {
   const rows = normalizeGradeRows([
-    { courseCode: 'AI101', courseName: '人工智能公开课', score: '100', credit: '2', gpa: '', term: '2026春' },
+    { courseCode: 'AI101', courseName: '人工智能公开课', score: '100', credit: '2', term: '2026春' },
   ]);
 
   assert.equal(rows[0].key, 'AI101::人工智能公开课');
@@ -220,21 +219,21 @@ test('normalizeGradeRows builds stable keys with course code when present', () =
 
 test('diffGrades reports added and changed rows', () => {
   const previous = [
-    { key: '大学英语', courseName: '大学英语', score: '88', credit: '2', gpa: '3.7', term: '2026春' },
+    { key: '大学英语', courseName: '大学英语', score: '88', credit: '2', term: '2026春' },
   ];
   const current = [
-    { key: '大学英语', courseName: '大学英语', score: '91', credit: '2', gpa: '4.0', term: '2026春' },
-    { key: '人工智能', courseName: '人工智能', score: '100', credit: '2', gpa: '4.0', term: '2026春' },
+    { key: '大学英语', courseName: '大学英语', score: '91', credit: '2', term: '2026春' },
+    { key: '人工智能', courseName: '人工智能', score: '100', credit: '2', term: '2026春' },
   ];
 
   assert.deepEqual(diffGrades(previous, current), {
     added: [
-      { key: '人工智能', courseName: '人工智能', score: '100', credit: '2', gpa: '4.0', term: '2026春' },
+      { key: '人工智能', courseName: '人工智能', score: '100', credit: '2', term: '2026春' },
     ],
     changed: [
       {
-        before: { key: '大学英语', courseName: '大学英语', score: '88', credit: '2', gpa: '3.7', term: '2026春' },
-        after: { key: '大学英语', courseName: '大学英语', score: '91', credit: '2', gpa: '4.0', term: '2026春' },
+        before: { key: '大学英语', courseName: '大学英语', score: '88', credit: '2', term: '2026春' },
+        after: { key: '大学英语', courseName: '大学英语', score: '91', credit: '2', term: '2026春' },
       },
     ],
   });
@@ -244,22 +243,24 @@ test('formatGradeNotification includes added and changed grades in plain text re
   const message = formatGradeNotification({
     term: '2026春',
     currentRows: [
-      { courseName: '人工智能', score: '100', credit: '2', gpa: '4.0', term: '2026春' },
-      { courseName: '大学英语', score: '91', credit: '2', gpa: '4.0', term: '2026春' },
-      { courseName: '体育', score: '优秀', credit: '1', gpa: '', term: '2026春' },
-      { courseName: '上学期课程', score: '60', credit: '1', gpa: '', term: '2025秋' },
+      { courseName: '人工智能', score: '100', credit: '2', term: '2026春' },
+      { courseName: '大学英语', score: '91', credit: '2', term: '2026春' },
+      { courseName: '体育', score: '优秀', credit: '1', term: '2026春' },
+      { courseName: '上学期课程', score: '60', credit: '1', term: '2025秋' },
     ],
-    added: [{ courseName: '人工智能', score: '100', credit: '2', gpa: '4.0', term: '2026春' }],
+    added: [{ courseName: '人工智能', score: '100', credit: '2', term: '2026春' }],
     changed: [{
-      before: { courseName: '大学英语', score: '88', credit: '2', gpa: '3.7', term: '2026春' },
-      after: { courseName: '大学英语', score: '91', credit: '2', gpa: '4.0', term: '2026春' },
+      before: { courseName: '大学英语', score: '88', credit: '2', term: '2026春' },
+      after: { courseName: '大学英语', score: '91', credit: '2', term: '2026春' },
     }],
   });
 
   assert.match(message, /BBGU 成绩更新｜2026春/);
   assert.match(message, /人工智能/);
   assert.match(message, /88 -> 91/);
-  assert.match(message, /本学期算术平均分：95\.50（2 门）/);
+  assert.match(message, /算术平均分：95\.50（2 门）/);
+  assert.doesNotMatch(message, /绩点/);
+  assert.doesNotMatch(message, /说明：均分只计算/);
   assert.match(message, /本学期已出成绩/);
 });
 
@@ -272,21 +273,19 @@ test('formatGradeNotification produces compact plain text grade report', () => {
         courseName: '流体力学与液压传动',
         score: '59',
         credit: '3.0',
-        gpa: '1.0',
         term: '2026春',
         subScores: [
           { name: '平时成绩', weight: '30', score: '80' },
           { name: '期末成绩', weight: '70', score: '50' },
         ],
       },
-      { courseName: '中外航海文化', score: '99', credit: '1.0', gpa: '', term: '2026春' },
-      { courseName: '上学期课程', score: '60', credit: '1.0', gpa: '', term: '2025秋' },
+      { courseName: '中外航海文化', score: '99', credit: '1.0', term: '2026春' },
+      { courseName: '上学期课程', score: '60', credit: '1.0', term: '2025秋' },
     ],
     added: [{
       courseName: '流体力学与液压传动',
       score: '59',
       credit: '3.0',
-      gpa: '1.0',
       term: '2026春',
       subScores: [{ name: '平时成绩', weight: '30', score: '80' }],
     }],
@@ -295,12 +294,17 @@ test('formatGradeNotification produces compact plain text grade report', () => {
 
   assert.match(message, /^BBGU 成绩更新｜2026春/);
   assert.match(message, /检查时间：2026-07-02 18:10/);
-  assert.match(message, /新增 1 门｜变更 0 门｜本学期已出 2 门/);
-  assert.match(message, /本学期算术平均分：79\.00/);
-  assert.match(message, /┌/);
+  assert.match(message, /━━━━━━━━━━━━━━━━/);
+  assert.match(message, /新增 1 门｜变更 0 门｜已出 2 门/);
+  assert.match(message, /算术平均分：79\.00/);
+  assert.match(message, /┌──────────────────┬────┬────┐/);
   assert.match(message, /流体力学与液压传动/);
-  assert.match(message, /平时分：平时成绩\(30%\) 80/);
+  assert.match(message, /成绩：59｜学分：3\.0/);
+  assert.doesNotMatch(message, /绩点/);
+  assert.match(message, /平时分：\n   - 平时成绩\(30%\) 80/);
   assert.match(message, /期末成绩\(70%\) 50/);
+  assert.doesNotMatch(message, /其他 1 门：暂无保存记录/);
+  assert.doesNotMatch(message, /说明：均分只计算/);
   assert.doesNotMatch(message, /上学期课程/);
 });
 
@@ -312,7 +316,6 @@ test('formatPushPlusGradeTextContent wraps text report and truncates oversized n
     courseName: `超长课程名称-${index}`,
     score: String(60 + (index % 40)),
     credit: '2.0',
-    gpa: '3.0',
     term: '2026春',
     subScores: [
       { name: '平时成绩', weight: '30', score: String(80 + (index % 10)) },
@@ -335,7 +338,7 @@ test('formatPushPlusGradeTextContent wraps text report and truncates oversized n
   assert.match(content, /```$/);
 });
 
-test('sendPushPlus can send HTML template messages', async () => {
+test('sendPushPlus sends markdown template messages', async () => {
   const originalFetch = global.fetch;
   const calls = [];
   global.fetch = async (url, options) => {
@@ -351,12 +354,11 @@ test('sendPushPlus can send HTML template messages', async () => {
       token: 'push-token',
       title: 'BBGU 成绩更新',
       content: '<div>ok</div>',
-      template: 'html',
     });
 
     const body = JSON.parse(calls[0].options.body);
     assert.equal(calls[0].url, 'https://www.pushplus.plus/send');
-    assert.equal(body.template, 'html');
+    assert.equal(body.template, 'markdown');
     assert.equal(body.content, '<div>ok</div>');
   } finally {
     global.fetch = originalFetch;
@@ -488,7 +490,6 @@ test('normalizeBbguScoreApiData converts real BBGU score response shape', () => 
       scoreId: '25201881',
       score: '99',
       credit: '1.0',
-      gpa: '',
       term: '2026春',
     },
   ]);
@@ -590,10 +591,9 @@ test('enrichRowsWithSubScores logs available fields when added rows miss scoreId
   }
 });
 
-test('buildAuthorizationHeader accepts full header, raw token, and JSON-stringified token', () => {
-  assert.equal(buildAuthorizationHeader('Bearer abc.def.ghi', ''), 'Bearer abc.def.ghi');
-  assert.equal(buildAuthorizationHeader('', 'abc.def.ghi'), 'Bearer abc.def.ghi');
-  assert.equal(buildAuthorizationHeader('', '"abc.def.ghi"'), 'Bearer abc.def.ghi');
+test('buildAuthorizationHeader accepts raw token and JSON-stringified token', () => {
+  assert.equal(buildAuthorizationHeader('abc.def.ghi'), 'Bearer abc.def.ghi');
+  assert.equal(buildAuthorizationHeader('"abc.def.ghi"'), 'Bearer abc.def.ghi');
 });
 
 test('extractJwtExpiry decodes JWT exp claim', () => {
@@ -605,64 +605,12 @@ test('extractJwtExpiry decodes JWT exp claim', () => {
   assert.equal(extractJwtExpiry(`Bearer ${token}`).epochSeconds, 1782914400);
 });
 
-test('summarizeCasCookies extracts CAS cookie expiry from storage state', () => {
-  const cookies = summarizeCasCookies({
-    cookies: [
-      { name: 'SESSION', domain: 'zhjw.bbgu.edu.cn', expires: -1 },
-      { name: 'CASTGC', domain: 'zhjw.bbgu.edu.cn', expires: 1782914400 },
-      { name: 'TGC', domain: 'example.com', expires: 1782910000 },
-    ],
-  });
-
-  assert.deepEqual(cookies.map((cookie) => ({
-    name: cookie.name,
-    domain: cookie.domain,
-    epochSeconds: cookie.epochSeconds,
-    sessionCookie: cookie.sessionCookie,
-  })), [
-    { name: 'CASTGC', domain: 'zhjw.bbgu.edu.cn', epochSeconds: 1782914400, sessionCookie: false },
-    { name: 'SESSION', domain: 'zhjw.bbgu.edu.cn', epochSeconds: null, sessionCookie: true },
-  ]);
-});
-
-test('formatCasDiagnostics reports cookie and token movement', () => {
-  const message = formatCasDiagnostics({
-    before: {
-      tokenExpiry: { text: '2026-07-01 20:00:00' },
-      casCookies: [{ name: 'CASTGC', domain: 'zhjw.bbgu.edu.cn', text: '2026-07-01 23:00:00' }],
-    },
-    after: {
-      tokenExpiry: { text: '2026-07-01 22:00:00' },
-      casCookies: [{ name: 'CASTGC', domain: 'zhjw.bbgu.edu.cn', text: '2026-07-02 01:00:00' }],
-    },
-    renewResult: { status: 'renew_ok' },
-  });
-
-  assert.match(message, /Silent renew: renew_ok/);
-  assert.match(message, /access token/);
-  assert.match(message, /CASTGC/);
-  assert.match(message, /2026-07-02 01:00:00/);
-});
-
 test('isAuthExpiredResponse detects expired token responses', () => {
   assert.equal(isAuthExpiredResponse({ httpStatus: 401, text: '', body: null }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '<html>统一身份认证</html>', body: null }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"fail"}', body: { status: 'fail', msg: 'token expired' } }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"success"}', body: { status: 'success', ok: true } }), false);
   assert.equal(isAuthExpiredResponse({ httpStatus: 502, text: '{"ok":false,"msg":"bad gateway"}', body: { ok: false, msg: 'bad gateway' } }), false);
-});
-
-test('formatAuthExpiredMessage explains how to renew BBGU_ACCESS_TOKEN', () => {
-  const message = formatAuthExpiredMessage({ homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home' });
-  assert.match(message, /BBGU 登录态已过期/);
-  assert.match(message, /cqu_edu_ACCESS_TOKEN/);
-  assert.match(message, /BBGU_ACCESS_TOKEN/);
-});
-
-test('parseSavedAccessToken accepts plain token and env-file style token', () => {
-  assert.equal(parseSavedAccessToken('abc.def.ghi\n'), 'abc.def.ghi');
-  assert.equal(parseSavedAccessToken('BBGU_ACCESS_TOKEN=abc.def.ghi\n'), 'abc.def.ghi');
-  assert.equal(parseSavedAccessToken('# comment\nBBGU_ACCESS_TOKEN=\"abc.def.ghi\"\n'), 'abc.def.ghi');
 });
 
 test('parseSavedAuthState reads access and refresh tokens and keeps legacy formats', () => {
@@ -676,6 +624,10 @@ test('parseSavedAuthState reads access and refresh tokens and keeps legacy forma
   });
   assert.deepEqual(parseSavedAuthState('legacy.access.jwt\n'), {
     accessToken: 'legacy.access.jwt',
+    refreshToken: '',
+  });
+  assert.deepEqual(parseSavedAuthState('# comment\nBBGU_ACCESS_TOKEN=\"abc.def.ghi\"\n'), {
+    accessToken: 'abc.def.ghi',
     refreshToken: '',
   });
 });
@@ -805,7 +757,7 @@ test('已安装的二维码依赖可以真实解码PNG并渲染文本二维码',
 test('formatQrLoginMessage can render text QR fallback without official QR image or failing mobile link', () => {
   const message = formatQrLoginMessage({
     homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
-    screenshotPath: '/ql/data/scripts/bbgu/qr.png',
+    screenshotPath: '/home/runner/work/bbgu-data/qr.png',
     qrImageUrl: 'https://open.weixin.qq.com/connect/qrcode/abc123',
     textQr: '██  ██\n  ████',
     waitSeconds: 600,
@@ -819,7 +771,7 @@ test('formatQrLoginMessage can render text QR fallback without official QR image
   assert.match(message, /&nbsp;/);
   assert.match(message, /微信扫码识别下方文本二维码/);
   assert.match(message, /██&nbsp;&nbsp;██/);
-  assert.match(message, /青龙文件管理/);
+  assert.match(message, /打开上面的截图路径/);
   assert.match(message, /access\/refresh token/);
 });
 
@@ -834,7 +786,7 @@ test('formatQrLoginMessage在GitHub环境隐藏无用的Runner截图路径', () 
 
   assert.match(message, /微信扫码识别下方文本二维码/);
   assert.doesNotMatch(message, /\/home\/runner/);
-  assert.doesNotMatch(message, /青龙文件管理/);
+  assert.doesNotMatch(message, /二维码截图路径/);
 });
 
 test('buildWeixinQrConfirmUrl converts WeChat qrcode image URL to scan confirmation URL', () => {
@@ -848,13 +800,13 @@ test('buildWeixinQrConfirmUrl converts WeChat qrcode image URL to scan confirmat
 test('formatQrLoginMessage falls back to screenshot path when text QR is unavailable', () => {
   const message = formatQrLoginMessage({
     homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
-    screenshotPath: '/ql/data/scripts/bbgu/qr.png',
+    screenshotPath: '/home/runner/work/bbgu-data/qr.png',
     qrImageUrl: 'https://open.weixin.qq.com/connect/qrcode/abc123',
     waitSeconds: 600,
   });
 
   assert.match(message, /二维码截图路径/);
-  assert.match(message, /青龙文件管理/);
+  assert.match(message, /打开上面的截图路径/);
   assert.match(message, /600 秒/);
   assert.doesNotMatch(message, /<img /);
   assert.doesNotMatch(message, /data:image/);
@@ -957,16 +909,6 @@ test('GitHub环境没有可扫码二维码时立即中止登录等待', () => {
   }), false);
 });
 
-test('getConfig enables automatic QR login on expired token by default', () => {
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token' }).autoLoginOnExpired, true);
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token', BBGU_AUTO_LOGIN_ON_EXPIRED: '0' }).autoLoginOnExpired, false);
-});
-
-test('getConfig enables silent CAS renew on expired token by default', () => {
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token' }).silentRenewOnExpired, true);
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token', BBGU_SILENT_RENEW_ON_EXPIRED: '0' }).silentRenewOnExpired, false);
-});
-
 test('getConfig读取BBGU_PROXY_SERVER', () => {
   const config = getConfig({ BBGU_PROXY_SERVER: 'http://127.0.0.1:7890' });
 
@@ -997,8 +939,6 @@ test('isRecoverableNavigationAbort accepts CAS redirect navigation aborts only',
 test('recoverDirectApiAfterAuthExpired stops after successful refresh token renewal', async () => {
   const calls = [];
   const config = {
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: true,
     tokenPath: 'token.env',
   };
 
@@ -1023,8 +963,6 @@ test('recoverDirectApiAfterAuthExpired schedules QR from last access expiry afte
   const calls = [];
   const nowMs = Date.parse('2026-07-04T15:30:00+08:00');
   const config = {
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: true,
     tokenPath: 'token.env',
   };
 
@@ -1062,8 +1000,6 @@ test('recoverDirectApiAfterAuthExpired schedules QR from last access expiry afte
 test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', async () => {
   const calls = [];
   const config = {
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: true,
     tokenPath: 'token.env',
   };
 
@@ -1092,20 +1028,21 @@ test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', as
   assert.deepEqual(calls, ['refresh', 'scheduled-qr']);
 });
 
-test('run starts automatic login recovery when no saved direct API token exists', async () => {
+test('run starts automatic login recovery when saved direct API token is expired', async () => {
   const calls = [];
   const config = {
     pushplusToken: 'push-token',
     tokenPath: 'token.env',
-    autoLoginOnExpired: true,
-    silentRenewOnExpired: false,
+    authorization: 'Bearer expired-token',
     term: '2026春',
   };
 
   const result = await run(config, {
-    readSavedAccessTokenFn: async () => {
-      calls.push('read-token');
-      return '';
+    fetchScoreRowsFn: async () => {
+      calls.push('fetch-expired');
+      const error = new Error('expired');
+      error.code = 'BBGU_AUTH_EXPIRED';
+      throw error;
     },
     recoverDirectApiAfterAuthExpiredFn: async (nextConfig) => {
       calls.push(`recover:${nextConfig.tokenPath}`);
@@ -1119,9 +1056,53 @@ test('run starts automatic login recovery when no saved direct API token exists'
   });
 
   assert.deepEqual(calls, [
-    'read-token',
+    'fetch-expired',
     'recover:token.env',
     'process:Bearer renewed-token:1',
+  ]);
+  assert.deepEqual(result, { status: 'ok', count: 1 });
+});
+
+test('run starts first QR login when no saved token exists', async () => {
+  const calls = [];
+  const config = {
+    pushplusToken: 'push-token',
+    tokenPath: 'token.env',
+    term: '2026春',
+  };
+
+  const result = await run(config, {
+    readSavedAuthStateFn: async () => {
+      calls.push('read-auth');
+      return { accessToken: '', refreshToken: '' };
+    },
+    recoverDirectApiAfterAuthExpiredFn: async () => calls.push('recover-expired'),
+    runLoginFn: async (nextConfig, options) => {
+      calls.push(`login:${Boolean(options && options.ignoreInitialAccessToken)}`);
+      nextConfig.authorization = 'Bearer first-login-token';
+    },
+    readSavedAuthStateAfterLoginFn: async () => {
+      calls.push('read-auth-after-login');
+      return { accessToken: 'first-login-token', refreshToken: 'first-refresh-token' };
+    },
+    fetchScoreRowsFn: async (nextConfig) => {
+      calls.push(`fetch:${nextConfig.authorization}`);
+      return [{ key: 'A', courseName: 'A', score: '99', term: '2026春' }];
+    },
+    processGradeRowsFn: async (rows) => {
+      calls.push(`process:${rows.length}`);
+      return { status: 'ok', count: rows.length };
+    },
+    maybeRunScheduledQrFn: async () => calls.push('qr-check'),
+  });
+
+  assert.deepEqual(calls, [
+    'read-auth',
+    'login:true',
+    'read-auth-after-login',
+    'fetch:Bearer first-login-token',
+    'process:1',
+    'qr-check',
   ]);
   assert.deepEqual(result, { status: 'ok', count: 1 });
 });
@@ -1132,7 +1113,6 @@ test('成绩处理成功后检查待处理二维码提醒', async () => {
     pushplusToken: 'push-token',
     tokenPath: 'token.env',
     authorization: 'Bearer current-token',
-    autoLoginOnExpired: true,
     term: '2026春',
   };
 
@@ -1158,7 +1138,7 @@ test('CAS续期成功后renew结束并清除待扫码状态', async () => {
   const calls = [];
   const logs = [];
   const nowMs = Date.parse('2026-07-05T17:30:00+08:00');
-  const result = await runRenew({ autoLoginOnExpired: true }, {
+  const result = await runRenew({}, {
     nowFn: () => nowMs,
     readQrReminderStateFn: async () => null,
     runSilentRenewFn: async () => { calls.push('cas'); return { status: 'renew_ok' }; },
@@ -1180,7 +1160,7 @@ test('CAS续期成功后renew结束并清除待扫码状态', async () => {
 
 test('CAS首次失败后记录失效并使用Refresh续Access', async () => {
   const calls = [];
-  const result = await runRenew({ autoLoginOnExpired: true }, {
+  const result = await runRenew({}, {
     readQrReminderStateFn: async () => null,
     runSilentRenewFn: async () => { calls.push('cas'); throw new Error('CAS已失效'); },
     markCasExpiredFn: async () => calls.push('mark-cas-expired'),
@@ -1201,7 +1181,7 @@ test('CAS已记录失效后renew跳过CAS并直接使用Refresh', async () => {
     refreshToken: makeJwt({ exp: nowMs / 1000 + 10 * 3600 }),
     accessToken: makeJwt({ exp: nowMs / 1000 + 12 * 3600 }),
   };
-  const result = await runRenew({ autoLoginOnExpired: true }, {
+  const result = await runRenew({}, {
     nowFn: () => nowMs,
     readQrReminderStateFn: async () => ({ casExpired: true }),
     runSilentRenewFn: async () => calls.push('cas'),
@@ -1220,7 +1200,7 @@ test('CAS已记录失效后renew跳过CAS并直接使用Refresh', async () => {
 test('CAS和Refresh都失效后renew根据最后一枚Access安排扫码', async () => {
   const calls = [];
   const logs = [];
-  const result = await runRenew({ autoLoginOnExpired: true, tokenPath: 'token.env' }, {
+  const result = await runRenew({ tokenPath: 'token.env' }, {
     nowFn: () => Date.parse('2026-07-04T15:30:00+08:00'),
     readQrReminderStateFn: async () => ({ casExpired: true }),
     runSilentRenewFn: async () => calls.push('cas'),
@@ -1255,7 +1235,7 @@ test('renew遇到Refresh服务器故障时不安排二维码', async () => {
   error.httpStatus = 502;
 
   await assert.rejects(
-    runRenew({ autoLoginOnExpired: true, tokenPath: 'token.env' }, {
+    runRenew({ tokenPath: 'token.env' }, {
       readQrReminderStateFn: async () => ({ casExpired: true }),
       refreshAndSaveAuthStateFn: async () => {
         calls.push('refresh');
@@ -1549,11 +1529,6 @@ test('refreshAndSaveAuthState migrates refresh token from browser storage state'
   ]);
 });
 
-test('getConfig disables login-updated notification by default', () => {
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token' }).notifyLoginUpdated, false);
-  assert.equal(getConfig({ PUSHPLUS_TOKEN: 'token', BBGU_NOTIFY_LOGIN_UPDATED: '1' }).notifyLoginUpdated, true);
-});
-
 test('isLikelyQrLoginUrl rejects ordinary login page images', () => {
   assert.equal(isLikelyQrLoginUrl('https://zhjw.bbgu.edu.cn/assets/login/1.jpg'), false);
   assert.equal(isLikelyQrLoginUrl('https://zhjw.bbgu.edu.cn/static/auth-background.jpg'), false);
@@ -1578,43 +1553,8 @@ test('extractWeixinQrConnectUrlFromHtml parses combined login HTML', () => {
   );
 });
 
-test('extractLoginDebugUrlsFromHtml collects WeChat and CAS login URLs', () => {
-  const html = `
-    <iframe src="/authserver/combinedLogin.do?type=weixin"></iframe>
-    <a href="https://open.weixin.qq.com/connect/qrconnect?appid=wx123&amp;state=qr"></a>
-    <script>
-      const mobile = "https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx123&state=mobile#wechat_redirect";
-      const other = "https://example.com/not-login";
-    </script>
-  `;
-
-  const urls = extractLoginDebugUrlsFromHtml(html, 'https://authserver.bbgu.edu.cn/authserver/login');
-
-  assert.ok(urls.includes('https://authserver.bbgu.edu.cn/authserver/combinedLogin.do?type=weixin'));
-  assert.ok(urls.includes('https://open.weixin.qq.com/connect/qrconnect?appid=wx123&state=qr'));
-  assert.ok(urls.includes('https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx123&state=mobile#wechat_redirect'));
-  assert.equal(urls.some((url) => url.includes('example.com/not-login')), false);
-});
-
-test('classifyLoginDebugUrls separates mobile OAuth candidates from QR login URLs', () => {
-  const classified = classifyLoginDebugUrls([
-    'https://open.weixin.qq.com/connect/qrconnect?appid=wx123&state=qr',
-    'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx123&state=mobile#wechat_redirect',
-    'https://authserver.bbgu.edu.cn/authserver/combinedLogin.do?type=weixin',
-  ]);
-
-  assert.deepEqual(classified.mobileOauthCandidates, [
-    'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx123&state=mobile#wechat_redirect',
-  ]);
-  assert.deepEqual(classified.qrConnectUrls, [
-    'https://open.weixin.qq.com/connect/qrconnect?appid=wx123&state=qr',
-  ]);
-  assert.equal(classified.otherLoginUrls.length, 1);
-});
-
 test('selectChromiumExecutable prefers system Chromium on Alpine over Playwright glibc build', () => {
   const selected = selectChromiumExecutable({
-    configured: '',
     osRelease: 'NAME="Alpine Linux"\nID=alpine\n',
     homeDir: '/root',
     exists: (filePath) => [

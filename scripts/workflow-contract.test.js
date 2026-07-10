@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const workflowPath = path.join(__dirname, '..', '.github', 'workflows', 'bbgu.yml');
 
-test('Workflow保持青龙定时并使用加密状态分支', () => {
+test('Workflow保持GitHub定时并使用加密状态分支', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
 
   assert.match(yaml, /cron: ['"]0 10-22 \* \* \*['"]/);

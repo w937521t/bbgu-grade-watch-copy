@@ -28,11 +28,7 @@ jobs:
     timeout-minutes: 20
     env:
       BBGU_DATA_DIR: ${{ github.workspace }}/bbgu-data
-      BBGU_HEADLESS: 'true'
-      BBGU_AUTO_LOGIN_ON_EXPIRED: '1'
-      BBGU_SILENT_RENEW_ON_EXPIRED: '1'
       BBGU_LOGIN_WAIT_SECONDS: '300'
-      BBGU_NOTIFY_NO_CHANGE: '0'
     steps:
       - name: 检出程序
         uses: actions/checkout@v4
@@ -246,7 +242,6 @@ jobs:
             bbgu_token.env
             bbgu_storage_state.json
             bbgu_grade_snapshot.json
-            bbgu_auth_expired_state.json
             bbgu_qr_reminder_state.json
             bbgu_proxy_state.json
           )

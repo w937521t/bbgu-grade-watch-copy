@@ -66,9 +66,7 @@ function unquoteToken(value) {
   return text;
 }
 
-function buildAuthorizationHeader(authorization, accessToken) {
-  const fullHeader = clean(authorization);
-  if (fullHeader) return /^Bearer\s+/i.test(fullHeader) ? fullHeader : `Bearer ${unquoteToken(fullHeader)}`;
+function buildAuthorizationHeader(accessToken) {
   const token = unquoteToken(accessToken);
   return token ? `Bearer ${token}` : '';
 }
@@ -93,10 +91,6 @@ function parseSavedAuthState(content) {
     if (key === 'BBGU_REFRESH_TOKEN') state.refreshToken = value;
   }
   return state;
-}
-
-function parseSavedAccessToken(content) {
-  return parseSavedAuthState(content).accessToken;
 }
 
 function extractAuthStateFromStorageState(storageState, origin) {
@@ -256,59 +250,6 @@ function shouldPushQrNow({ nowMs, dueAtMs, lastPushedAtMs = 0 }) {
   return nowMs - lastPushedAtMs >= QR_REMINDER_COOLDOWN_MS;
 }
 
-function summarizeCasCookies(storageState) {
-  return ((storageState && storageState.cookies) || [])
-    .filter((cookie) => {
-      const domain = String(cookie.domain || '').toLowerCase();
-      const name = String(cookie.name || '').toLowerCase();
-      const bbguDomain = /bbgu\.edu\.cn$/.test(domain.replace(/^\./, ''));
-      const authCookie = name === 'session' || /cas|tgc|ticket|authserver/i.test(`${name} ${domain}`);
-      return bbguDomain && authCookie;
-    })
-    .map((cookie) => {
-      const epochSeconds = Number(cookie.expires);
-      const sessionCookie = !Number.isFinite(epochSeconds) || epochSeconds <= 0;
-      return {
-        name: cookie.name || '',
-        domain: cookie.domain || '',
-        path: cookie.path || '',
-        epochSeconds: sessionCookie ? null : epochSeconds,
-        iso: sessionCookie ? '' : new Date(epochSeconds * 1000).toISOString(),
-        text: sessionCookie ? 'Session cookie' : formatEpochSeconds(epochSeconds),
-        sessionCookie,
-      };
-    })
-    .sort((a, b) => `${a.domain} ${a.name}`.localeCompare(`${b.domain} ${b.name}`));
-}
-
-function formatCasDiagnostics({ before, after, renewResult }) {
-  function formatToken(label, tokenExpiry) {
-    return `- ${label} access token exp: ${(tokenExpiry && tokenExpiry.text) || '未检测到'}`;
-  }
-
-  function formatCookies(label, cookies) {
-    if (!cookies || !cookies.length) return [`- ${label} CAS cookies: 未检测到`];
-    return [
-      `- ${label} CAS cookies:`,
-      ...cookies.map((cookie) => `  - ${cookie.name}@${cookie.domain}${cookie.path || ''}: ${cookie.text}`),
-    ];
-  }
-
-  return [
-    '# BBGU CAS 续期诊断',
-    '',
-    `检查时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}`,
-    `Silent renew: ${(renewResult && renewResult.status) || 'unknown'}`,
-    '',
-    formatToken('renew 前', before && before.tokenExpiry),
-    formatToken('renew 后', after && after.tokenExpiry),
-    '',
-    ...formatCookies('renew 前', before && before.casCookies),
-    '',
-    ...formatCookies('renew 后', after && after.casCookies),
-  ].join('\n');
-}
-
 function normalizeGradeRows(rows) {
   const normalized = [];
 
@@ -318,11 +259,10 @@ function normalizeGradeRows(rows) {
     const scoreId = firstNonEmpty(row.scoreId, row.score_id, row.id);
     const score = firstNonEmpty(row.scoreShow, row.effectiveScoreShow, row.score, row.effectiveScore, row.grade, row.cj, row.CJ, row.zcj, row.finalScore, row['成绩'], row['总成绩']);
     const credit = firstNonEmpty(row.credit, row.credits, row.courseCredit, row.xf, row.XF, row['学分']);
-    const gpa = firstNonEmpty(row.gpa, row.jd, row.JD, row.gradePoint, row['绩点']);
     const term = firstNonEmpty(row.term, row.sessionName, row.semester, row.xq, row.xnxq, row.academicTerm, row['学期'], row['学年学期']);
 
     if (!courseName && !courseCode) continue;
-    if (!score && !credit && !gpa && !term) continue;
+    if (!score && !credit && !term) continue;
 
     normalized.push({
       key: courseCode ? `${courseCode}::${courseName || courseCode}` : courseName,
@@ -331,7 +271,6 @@ function normalizeGradeRows(rows) {
       ...(!scoreId && Array.isArray(row.__bbguSourceKeys) ? { sourceKeys: row.__bbguSourceKeys.map(clean).filter(Boolean).sort() } : {}),
       score,
       credit,
-      gpa,
       term,
     });
   }
@@ -360,7 +299,6 @@ function normalizeBbguScoreApiData(data, preferredTerm = '') {
         scoreId: firstNonEmpty(item.scoreId, item.score_id, item.id),
         score: firstNonEmpty(item.effectiveScoreShow, item.scoreShow, item.effectiveScore, item.score),
         credit: item.courseCredit,
-        gpa: item.gpa,
         term: firstNonEmpty(item.sessionName, termName),
         __bbguSourceKeys: Object.keys(item || {}),
       });
@@ -375,7 +313,6 @@ function gradeSignature(row) {
     courseName: row.courseName || '',
     score: row.score || '',
     credit: row.credit || '',
-    gpa: row.gpa || '',
     term: row.term || '',
   });
 }
@@ -554,6 +491,16 @@ function formatSubScoreText(row) {
     .join('；');
 }
 
+function formatSubScoreItems(row) {
+  const subScores = Array.isArray(row && row.subScores) ? row.subScores : [];
+  return subScores.map((item) => {
+    const name = clean(item.name) || '未命名项目';
+    const score = clean(item.score) || '-';
+    const weight = clean(item.weight);
+    return `${name}${weight ? `(${weight}%)` : ''} ${score}`;
+  });
+}
+
 function textDisplayWidth(value) {
   let width = 0;
   for (const char of String(value ?? '')) {
@@ -582,7 +529,7 @@ function padTextRight(value, width) {
 }
 
 function formatPlainGradeTable(rows) {
-  const widths = { course: 22, score: 6, credit: 6 };
+  const widths = { course: 18, score: 4, credit: 4 };
   const borderTop = `┌${'─'.repeat(widths.course)}┬${'─'.repeat(widths.score)}┬${'─'.repeat(widths.credit)}┐`;
   const borderMid = `├${'─'.repeat(widths.course)}┼${'─'.repeat(widths.score)}┼${'─'.repeat(widths.credit)}┤`;
   const borderBottom = `└${'─'.repeat(widths.course)}┴${'─'.repeat(widths.score)}┴${'─'.repeat(widths.credit)}┘`;
@@ -605,20 +552,28 @@ function formatGradeNotification({ term, added, changed, currentRows, checkedAt 
     `BBGU 成绩更新${selectedTerm ? `｜${selectedTerm}` : ''}`,
     `检查时间：${checkedText}`,
     '',
-    '本次变化',
-    `新增 ${(added || []).length} 门｜变更 ${(changed || []).length} 门｜本学期已出 ${rows.length} 门`,
+    '━━━━━━━━━━━━━━━━',
+    `新增 ${(added || []).length} 门｜变更 ${(changed || []).length} 门｜已出 ${rows.length} 门`,
   ];
 
   if (average) {
-    lines.push(`本学期算术平均分：${average.average.toFixed(2)}（${average.count} 门）`);
+    lines.push(`算术平均分：${average.average.toFixed(2)}（${average.count} 门）`);
   }
+  lines.push('━━━━━━━━━━━━━━━━');
 
   if (added?.length) {
     lines.push('', '新增成绩');
     added.forEach((row, index) => {
+      if (index > 0) lines.push('');
       lines.push(`${index + 1}. ${row.courseName || row.key || '未知课程'}`);
-      lines.push(`   成绩：${row.score || '-'}｜学分：${row.credit || '-'}｜绩点：${row.gpa || '-'}`);
-      lines.push(`   平时分：${formatSubScoreText(row)}`);
+      lines.push(`   成绩：${row.score || '-'}｜学分：${row.credit || '-'}`);
+      const subScoreItems = formatSubScoreItems(row);
+      if (subScoreItems.length) {
+        lines.push('   平时分：');
+        lines.push(...subScoreItems.map((item) => `   - ${item}`));
+      } else {
+        lines.push(`   平时分：${formatSubScoreText(row)}`);
+      }
     });
   }
 
@@ -627,9 +582,16 @@ function formatGradeNotification({ term, added, changed, currentRows, checkedAt 
     changed.forEach((item, index) => {
       const before = item.before || {};
       const after = item.after || {};
+      if (index > 0) lines.push('');
       lines.push(`${index + 1}. ${after.courseName || after.key || '未知课程'}`);
-      lines.push(`   成绩：${before.score || '空'} -> ${after.score || '空'}｜绩点：${before.gpa || '空'} -> ${after.gpa || '空'}`);
-      lines.push(`   平时分：${formatSubScoreText(after)}`);
+      lines.push(`   成绩：${before.score || '空'} -> ${after.score || '空'}`);
+      const subScoreItems = formatSubScoreItems(after);
+      if (subScoreItems.length) {
+        lines.push('   平时分：');
+        lines.push(...subScoreItems.map((subScore) => `   - ${subScore}`));
+      } else {
+        lines.push(`   平时分：${formatSubScoreText(after)}`);
+      }
     });
   }
 
@@ -641,24 +603,21 @@ function formatGradeNotification({ term, added, changed, currentRows, checkedAt 
   const rowsWithSubScoreErrors = rows.filter((row) => row.subScoreFetchError && !(Array.isArray(row.subScores) && row.subScores.length));
   if (rowsWithSubScores.length || rowsWithSubScoreErrors.length) {
     for (const row of rowsWithSubScores) {
-      lines.push(`- ${row.courseName || row.key || '未知课程'}：${formatSubScoreText(row)}`);
+      lines.push(`- ${row.courseName || row.key || '未知课程'}`);
+      lines.push(...formatSubScoreItems(row).map((item) => `  - ${item}`));
     }
     for (const row of rowsWithSubScoreErrors) {
       lines.push(`- ${row.courseName || row.key || '未知课程'}：读取失败`);
     }
-    const emptyCount = rows.length - rowsWithSubScores.length - rowsWithSubScoreErrors.length;
-    if (emptyCount > 0) lines.push(`- 其他 ${emptyCount} 门：暂无保存记录`);
   } else {
     lines.push('- 暂无保存记录');
   }
-
-  lines.push('', '说明：均分只计算本学期数字成绩，文字成绩只展示不计入。');
 
   return lines.join('\n');
 }
 
 function truncateTextForPushPlus(rawText, maxChars) {
-  const suffix = '\n\n...内容过长，已截断；完整快照：/ql/data/scripts/bbgu_grade_snapshot.json';
+  const suffix = '\n\n...内容过长，已截断；完整快照保存在 GitHub Actions state 分支的加密状态包中。';
   if (rawText.length <= maxChars) return rawText;
   const budget = Math.max(0, maxChars - suffix.length);
   return `${Array.from(rawText).slice(0, budget).join('')}${suffix}`;
@@ -670,26 +629,6 @@ function formatPushPlusGradeTextContent({ maxChars = PUSHPLUS_CONTENT_MAX_CHARS,
   const rawMaxChars = Math.max(0, maxChars - fenceStart.length - fenceEnd.length);
   const rawText = truncateTextForPushPlus(formatGradeNotification(args), rawMaxChars);
   return `${fenceStart}${rawText}${fenceEnd}`;
-}
-
-function formatAuthExpiredMessage({ homeUrl }) {
-  return [
-    '# BBGU 登录态已过期',
-    '',
-    `检查时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
-    '',
-    '成绩接口返回登录失效，当前 `BBGU_ACCESS_TOKEN` 已不能继续使用。',
-    '',
-    `登录地址：${homeUrl}`,
-    '',
-    '更新方法：',
-    '1. 在本机浏览器重新打开教务系统并完成 CAS/微信扫码登录。',
-    '2. 打开 DevTools 的 `Application -> Local Storage -> https://zhjw.bbgu.edu.cn`。',
-    '3. 复制 `cqu_edu_ACCESS_TOKEN` 的值。',
-    '4. 更新青龙环境变量 `BBGU_ACCESS_TOKEN`。',
-    '',
-    '更新后下一次定时任务会继续检查成绩。',
-  ].join('\n');
 }
 
 function extractWeixinQrInfoFromHtml(html, responseUrl = '') {
@@ -729,71 +668,6 @@ function extractWeixinQrConnectUrlFromHtml(html) {
   const text = decodeHtmlEntities(html);
   const match = text.match(/https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect[^"'<>\\\s]+/i);
   return match ? clean(match[0]) : '';
-}
-
-function isLoginDebugUrl(value) {
-  const text = clean(value);
-  if (!/^https?:\/\//i.test(text)) return false;
-  try {
-    const parsed = new URL(text);
-    const host = parsed.hostname.toLowerCase();
-    const pathAndQuery = `${parsed.pathname}${parsed.search}${parsed.hash}`.toLowerCase();
-    const combined = `${host}${pathAndQuery}`;
-    if (/weixin|wechat/.test(host)) return true;
-    if (/bbgu\.edu\.cn|authserver|cas/.test(host)) {
-      return /weixin|wechat|oauth|qrconnect|qrcode|scan|authserver|cas|login|combinedlogin/.test(pathAndQuery);
-    }
-    return /weixin|wechat|oauth|qrconnect|qrcode/.test(combined);
-  } catch {
-    return false;
-  }
-}
-
-function extractLoginDebugUrlsFromHtml(html, baseUrl) {
-  const text = decodeHtmlEntities(html);
-  const urls = new Set();
-  const addUrl = (value) => {
-    const candidate = decodeHtmlEntities(value).trim();
-    if (!candidate) return;
-    try {
-      const resolved = new URL(candidate, baseUrl).toString();
-      if (isLoginDebugUrl(resolved)) urls.add(resolved);
-    } catch {
-      // Ignore malformed strings.
-    }
-  };
-
-  for (const match of text.matchAll(/https?:\/\/[^"'<>\\\s]+/gi)) {
-    addUrl(match[0]);
-  }
-  for (const match of text.matchAll(/\b(?:href|src|action|data-url|data-src|url)\s*=\s*["']([^"']+)["']/gi)) {
-    addUrl(match[1]);
-  }
-  for (const match of text.matchAll(/["'](\/[^"']*(?:weixin|wechat|oauth|qrconnect|qrcode|scan|authserver|cas|login)[^"']*)["']/gi)) {
-    addUrl(match[1]);
-  }
-
-  return [...urls].sort();
-}
-
-function classifyLoginDebugUrls(urls) {
-  const unique = [...new Set((urls || []).map((url) => clean(url)).filter(Boolean))].sort();
-  const mobileOauthCandidates = [];
-  const qrConnectUrls = [];
-  const otherLoginUrls = [];
-
-  for (const url of unique) {
-    const lower = url.toLowerCase();
-    if (lower.includes('/connect/oauth2/authorize')) {
-      mobileOauthCandidates.push(url);
-    } else if (lower.includes('/connect/qrconnect') || lower.includes('/connect/qrcode/')) {
-      qrConnectUrls.push(url);
-    } else {
-      otherLoginUrls.push(url);
-    }
-  }
-
-  return { mobileOauthCandidates, qrConnectUrls, otherLoginUrls };
 }
 
 async function fetchText(url, options = {}) {
@@ -962,10 +836,10 @@ function formatQrLoginMessage({
     '',
     textQr
       ? showScreenshotPath
-        ? `脚本会等待 ${waitSeconds} 秒。请优先用微信扫描文本二维码；如果不能识别，到青龙文件管理打开上面的截图路径并扫码。`
+        ? `脚本会等待 ${waitSeconds} 秒。请优先用微信扫描文本二维码；如果不能识别，请打开上面的截图路径并扫码。`
         : `脚本会等待 ${waitSeconds} 秒。请用微信扫描上方文本二维码。`
       : showScreenshotPath
-        ? `脚本会等待 ${waitSeconds} 秒。请立刻到青龙文件管理或服务器路径查看截图并扫码。`
+        ? `脚本会等待 ${waitSeconds} 秒。请立刻打开上面的截图路径并扫码。`
         : qrImageUrl
           ? `脚本会等待 ${waitSeconds} 秒。请打开上面的微信二维码图片源并扫码。`
           : '文本二维码生成失败，本次无法从GitHub完成扫码，请查看Actions日志。',
@@ -976,18 +850,6 @@ function formatQrLoginMessage({
 
 function shouldAbortGithubQrLogin({ githubActions, textQr, qrImageUrl }) {
   return Boolean(githubActions && !clean(textQr) && !clean(qrImageUrl));
-}
-
-function formatNoChangeMessage({ term, count }) {
-  return [
-    '# BBGU 成绩检查',
-    '',
-    `检查时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
-    term ? `学期：${term}` : '',
-    `当前识别到成绩条数：${count}`,
-    '',
-    '本次没有发现新增或变更成绩。',
-  ].filter(Boolean).join('\n');
 }
 
 async function readJson(filePath, fallback) {
@@ -1053,7 +915,7 @@ async function clearQrReminderState(config) {
   await fsp.rm(config.qrReminderStatePath, { force: true });
 }
 
-async function sendPushPlus({ token, title, content, template = 'markdown' }) {
+async function sendPushPlus({ token, title, content }) {
   const response = await fetch(PUSHPLUS_SEND_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1061,7 +923,7 @@ async function sendPushPlus({ token, title, content, template = 'markdown' }) {
       token,
       title,
       content,
-      template,
+      template: 'markdown',
     }),
   });
 
@@ -1084,24 +946,18 @@ function getConfig(env = process.env) {
   const dataDir = path.resolve(env.BBGU_DATA_DIR || __dirname);
   return {
     pushplusToken: clean(env.PUSHPLUS_TOKEN),
-    homeUrl: clean(env.BBGU_HOME_URL) || DEFAULT_HOME_URL,
+    homeUrl: DEFAULT_HOME_URL,
     term: clean(env.BBGU_TERM),
     proxyServer: clean(env.BBGU_PROXY_SERVER),
     githubActions: parseBooleanEnv(env.GITHUB_ACTIONS, false),
     dataDir,
-    cookie: clean(env.BBGU_COOKIE),
-    authorization: buildAuthorizationHeader(env.BBGU_AUTHORIZATION, env.BBGU_ACCESS_TOKEN),
-    tokenPath: path.resolve(env.BBGU_TOKEN_PATH || path.join(dataDir, 'bbgu_token.env')),
+    authorization: '',
+    tokenPath: path.resolve(path.join(dataDir, 'bbgu_token.env')),
     storageStatePath: path.join(dataDir, 'bbgu_storage_state.json'),
     snapshotPath: path.join(dataDir, 'bbgu_grade_snapshot.json'),
-    authExpiredStatePath: path.join(dataDir, 'bbgu_auth_expired_state.json'),
     qrReminderStatePath: path.join(dataDir, 'bbgu_qr_reminder_state.json'),
     diagnosticDir: path.join(dataDir, 'bbgu_diagnostics'),
-    headless: parseBooleanEnv(env.BBGU_HEADLESS, true),
-    notifyNoChange: parseBooleanEnv(env.BBGU_NOTIFY_NO_CHANGE, false),
-    notifyLoginUpdated: parseBooleanEnv(env.BBGU_NOTIFY_LOGIN_UPDATED, false),
-    autoLoginOnExpired: parseBooleanEnv(env.BBGU_AUTO_LOGIN_ON_EXPIRED, true),
-    silentRenewOnExpired: parseBooleanEnv(env.BBGU_SILENT_RENEW_ON_EXPIRED, true),
+    headless: true,
     loginWaitSeconds: parsePositiveIntegerEnv(env.BBGU_LOGIN_WAIT_SECONDS, 600),
   };
 }
@@ -1137,18 +993,6 @@ async function saveAuthState(filePath, state) {
     '',
   ];
   await fsp.writeFile(filePath, lines.join('\n'), 'utf8');
-}
-
-async function readSavedAccessToken(filePath) {
-  return (await readSavedAuthState(filePath)).accessToken;
-}
-
-async function saveAccessToken(filePath, token) {
-  const current = await readSavedAuthState(filePath);
-  return saveAuthState(filePath, {
-    accessToken: token,
-    refreshToken: current.refreshToken,
-  });
 }
 
 async function readStorageState(filePath) {
@@ -1392,7 +1236,7 @@ async function refreshAndSaveAuthState(config, deps = {}) {
     try {
       const refreshed = await requestFn(config, current, deps);
       await saveAuthStateFn(config.tokenPath, refreshed);
-      config.authorization = buildAuthorizationHeader('', refreshed.accessToken);
+      config.authorization = buildAuthorizationHeader(refreshed.accessToken);
       return { status: 'refresh_ok', authState: refreshed };
     } catch (error) {
       lastError = error;
@@ -1402,17 +1246,6 @@ async function refreshAndSaveAuthState(config, deps = {}) {
     }
   }
   throw lastError;
-}
-
-async function collectCasDiagnosticSnapshot(config) {
-  const [token, storageState] = await Promise.all([
-    readSavedAccessToken(config.tokenPath),
-    readStorageState(config.storageStatePath),
-  ]);
-  return {
-    tokenExpiry: extractJwtExpiry(token),
-    casCookies: summarizeCasCookies(storageState),
-  };
 }
 
 function isAuthExpiredResponse({ httpStatus, text, body }) {
@@ -1437,37 +1270,6 @@ function isTerminalRefreshAuthFailure(error) {
   return httpStatus === 400 || httpStatus === 401 || httpStatus === 403;
 }
 
-async function notifyAuthExpiredOnce(config, reason) {
-  const previous = await readJson(config.authExpiredStatePath, null);
-  if (previous && previous.active) {
-    console.log(`[BBGU] Auth expired notification already sent at ${previous.notifiedAt}. reason=${reason}`);
-    return;
-  }
-
-  await sendPushPlus({
-    token: config.pushplusToken,
-    title: 'BBGU 登录态已过期',
-    content: formatAuthExpiredMessage({ homeUrl: config.homeUrl }),
-  });
-  await writeJson(config.authExpiredStatePath, {
-    active: true,
-    notifiedAt: new Date().toISOString(),
-    reason,
-  });
-  console.log('[BBGU] Auth expired notification sent.');
-}
-
-async function clearAuthExpiredState(config) {
-  const previous = await readJson(config.authExpiredStatePath, null);
-  if (previous && previous.active) {
-    await writeJson(config.authExpiredStatePath, {
-      active: false,
-      clearedAt: new Date().toISOString(),
-    });
-    console.log('[BBGU] Auth expired state cleared.');
-  }
-}
-
 function getBbguOrigin(config) {
   return new URL((config && config.homeUrl) || DEFAULT_HOME_URL).origin;
 }
@@ -1480,11 +1282,10 @@ function buildBbguApiHeaders(config, refererPath = '/workspace/home') {
     'user-agent': BBGU_BROWSER_USER_AGENT,
   };
   if (config.authorization) headers.authorization = config.authorization;
-  if (config.cookie) headers.cookie = config.cookie;
   return headers;
 }
 
-async function fetchBbguScoreRowsWithCookie(config) {
+async function fetchBbguScoreRows(config) {
   const response = await requestJsonText(BBGU_SCORE_API_URL, buildBbguApiHeaders(config));
 
   const text = response.text;
@@ -1493,10 +1294,7 @@ async function fetchBbguScoreRowsWithCookie(config) {
     body = JSON.parse(text);
   } catch {
     if (isAuthExpiredResponse({ httpStatus: response.status, text, body: null })) {
-      if (!config.autoLoginOnExpired) {
-        await notifyAuthExpiredOnce(config, `HTTP ${response.status} non-json auth page`);
-      }
-      const error = new Error('BBGU login state expired. Update BBGU_ACCESS_TOKEN in QingLong.');
+      const error = new Error('BBGU login state expired. GitHub Actions will try refresh token or QR login.');
       error.code = 'BBGU_AUTH_EXPIRED';
       throw error;
     }
@@ -1504,10 +1302,7 @@ async function fetchBbguScoreRowsWithCookie(config) {
   }
 
   if (isAuthExpiredResponse({ httpStatus: response.status, text, body })) {
-    if (!config.autoLoginOnExpired) {
-      await notifyAuthExpiredOnce(config, `HTTP ${response.status} ${body.status || ''} ${body.msg || ''}`);
-    }
-    const error = new Error('BBGU login state expired. Update BBGU_ACCESS_TOKEN in QingLong.');
+    const error = new Error('BBGU login state expired. GitHub Actions will try refresh token or QR login.');
     error.code = 'BBGU_AUTH_EXPIRED';
     throw error;
   }
@@ -1516,7 +1311,6 @@ async function fetchBbguScoreRowsWithCookie(config) {
     throw new Error(`BBGU score API failed HTTP ${response.status}: ${text.slice(0, 500)}`);
   }
 
-  await clearAuthExpiredState(config);
   return normalizeBbguScoreApiData(body.data, config.term);
 }
 
@@ -1766,13 +1560,6 @@ async function processGradeRows(currentRows, config) {
       content: formatPushPlusGradeTextContent({ term: config.term, added: diff.added, changed: diff.changed, currentRows: rowsWithSavedSubScores }),
     });
     console.log(`[BBGU] Grade changes sent. added=${diff.added.length}, changed=${diff.changed.length}`);
-  } else if (config.notifyNoChange) {
-    await sendPushPlus({
-      token: config.pushplusToken,
-      title: 'BBGU 成绩检查：无变化',
-      content: formatNoChangeMessage({ term: config.term, count: rowsWithSavedSubScores.length }),
-    });
-    console.log(`[BBGU] No changes. count=${rowsWithSavedSubScores.length}`);
   } else {
     console.log(`[BBGU] No grade changes. count=${rowsWithSavedSubScores.length}`);
   }
@@ -1899,74 +1686,6 @@ async function saveLoginTimeoutDiagnostics(page, config) {
   return { reportPath, screenshotPath };
 }
 
-async function collectLoginDebugInfo(page) {
-  const frames = typeof page.frames === 'function' ? page.frames() : [page];
-  const frameReports = [];
-  const allUrls = new Set();
-
-  for (const frame of frames) {
-    const frameUrl = typeof frame.url === 'function' ? frame.url() : '';
-    let title = '';
-    let html = '';
-    let text = '';
-
-    try {
-      title = clean(await frame.evaluate(() => document.title));
-    } catch {
-      title = '';
-    }
-    try {
-      html = typeof frame.content === 'function' ? await frame.content() : '';
-    } catch {
-      html = '';
-    }
-    try {
-      text = clean(await frame.locator('body').innerText({ timeout: 2000 }));
-    } catch {
-      text = '';
-    }
-
-    const urls = extractLoginDebugUrlsFromHtml(html, frameUrl || configSafeBaseUrl(page));
-    for (const url of urls) allUrls.add(url);
-    if (frameUrl && isLoginDebugUrl(frameUrl)) allUrls.add(frameUrl);
-
-    frameReports.push({
-      url: frameUrl,
-      title,
-      textPreview: text.slice(0, 1000),
-      urls,
-    });
-  }
-
-  const urls = [...allUrls].sort();
-  return {
-    createdAt: new Date().toISOString(),
-    pageUrl: typeof page.url === 'function' ? page.url() : '',
-    urls,
-    classified: classifyLoginDebugUrls(urls),
-    frames: frameReports,
-  };
-}
-
-function configSafeBaseUrl(page) {
-  try {
-    return typeof page.url === 'function' ? page.url() : DEFAULT_HOME_URL;
-  } catch {
-    return DEFAULT_HOME_URL;
-  }
-}
-
-async function saveLoginDebugReport(page, config) {
-  await fsp.mkdir(config.diagnosticDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const screenshotPath = await saveScreenshot(page, config, 'login-debug');
-  const reportPath = path.join(config.diagnosticDir, `${timestamp}-login-debug.json`);
-  const report = await collectLoginDebugInfo(page);
-  report.screenshotPath = screenshotPath;
-  await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
-  return { reportPath, screenshotPath, report };
-}
-
 async function waitForAuthenticationAfterQr(page, config) {
   const deadline = Date.now() + config.loginWaitSeconds * 1000;
   console.log(`[BBGU] Waiting up to ${config.loginWaitSeconds}s for QR login...`);
@@ -1994,10 +1713,6 @@ async function extractAuthStateFromPage(page) {
   };
 }
 
-async function extractAccessTokenFromPage(page) {
-  return (await extractAuthStateFromPage(page)).accessToken;
-}
-
 async function waitForAuthState(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let latest = emptyAuthState();
@@ -2023,20 +1738,7 @@ async function saveBrowserAuthState(page, config, deps = {}) {
   return authState;
 }
 
-async function waitForAccessToken(page, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const token = await extractAccessTokenFromPage(page);
-    if (token) return token;
-    await page.waitForTimeout(2000);
-  }
-  return '';
-}
-
-function selectChromiumExecutable({ configured, osRelease, homeDir, exists, readdir }) {
-  const configuredPath = clean(configured);
-  if (configuredPath && exists(configuredPath)) return configuredPath;
-
+function selectChromiumExecutable({ osRelease, homeDir, exists, readdir }) {
   const systemCandidates = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'];
   if (/ID=alpine|Alpine Linux/i.test(osRelease || '')) {
     const systemMatch = systemCandidates.find((candidate) => exists(candidate));
@@ -2071,7 +1773,6 @@ function findChromiumExecutable() {
     osRelease = '';
   }
   return selectChromiumExecutable({
-    configured: process.env.BBGU_CHROMIUM_EXECUTABLE,
     osRelease,
     homeDir: process.env.HOME || '',
     exists: (filePath) => fs.existsSync(filePath),
@@ -2159,7 +1860,6 @@ async function runSilentRenew(config = getConfig()) {
     }
 
     await context.storageState({ path: config.storageStatePath });
-    await clearAuthExpiredState(config);
     console.log(`[BBGU] Silent CAS renew completed. Access token saved: ${config.tokenPath}`);
     console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
     return { status: 'renew_ok', tokenPath: config.tokenPath };
@@ -2176,8 +1876,7 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
     saveQrReminderScheduleFn = saveQrReminderSchedule,
     clearQrReminderScheduleFn = clearQrReminderSchedule,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
-    readSavedAccessTokenFn = readSavedAccessToken,
-    fetchScoreRowsFn = fetchBbguScoreRowsWithCookie,
+    fetchScoreRowsFn = fetchBbguScoreRows,
   } = deps;
 
   try {
@@ -2208,29 +1907,31 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
   if (!qrResult || qrResult.status !== 'login_ok') {
     throw new Error('二维码提醒仍在冷却期，本次成绩查询无法登录。');
   }
-  const savedToken = await readSavedAccessTokenFn(config.tokenPath);
-  if (!savedToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
-  config.authorization = buildAuthorizationHeader('', savedToken);
+  const auth = await readSavedAuthStateFn(config.tokenPath);
+  if (!auth.accessToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
+  config.authorization = buildAuthorizationHeader(auth.accessToken);
   return fetchScoreRowsFn(config);
 }
 
 async function run(config = getConfig(), deps = {}) {
   const {
-    readSavedAccessTokenFn = readSavedAccessToken,
-    fetchScoreRowsFn = fetchBbguScoreRowsWithCookie,
+    readSavedAuthStateFn = readSavedAuthState,
+    fetchScoreRowsFn = fetchBbguScoreRows,
     recoverDirectApiAfterAuthExpiredFn = recoverDirectApiAfterAuthExpired,
+    runLoginFn = runLogin,
+    readSavedAuthStateAfterLoginFn = readSavedAuthStateFn,
     processGradeRowsFn = processGradeRows,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
   } = deps;
 
   if (!config.pushplusToken) {
-    throw new Error('Missing PUSHPLUS_TOKEN. Set it in QingLong environment variables.');
+    throw new Error('Missing PUSHPLUS_TOKEN. Set it in GitHub repository secrets.');
   }
 
   if (!config.authorization) {
-    const savedToken = await readSavedAccessTokenFn(config.tokenPath);
-    if (savedToken) {
-      config.authorization = buildAuthorizationHeader('', savedToken);
+    const auth = await readSavedAuthStateFn(config.tokenPath);
+    if (auth.accessToken) {
+      config.authorization = buildAuthorizationHeader(auth.accessToken);
       console.log(`[BBGU] Loaded saved access token from ${config.tokenPath}`);
     }
   }
@@ -2241,13 +1942,13 @@ async function run(config = getConfig(), deps = {}) {
     return result;
   };
 
-  if (config.authorization || config.cookie) {
-    console.log(`[BBGU] Using direct score API mode with ${config.authorization ? 'BBGU_AUTHORIZATION/BBGU_ACCESS_TOKEN' : 'BBGU_COOKIE'}.`);
+  if (config.authorization) {
+    console.log('[BBGU] Using direct score API mode with current access token.');
     let currentRows;
     try {
       currentRows = await fetchScoreRowsFn(config);
     } catch (error) {
-      if (error && error.code === 'BBGU_AUTH_EXPIRED' && config.autoLoginOnExpired) {
+      if (error && error.code === 'BBGU_AUTH_EXPIRED') {
         currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn });
       } else {
         throw error;
@@ -2256,18 +1957,20 @@ async function run(config = getConfig(), deps = {}) {
     return finishGradeRun(currentRows);
   }
 
-  if (!config.autoLoginOnExpired) {
-    throw new Error(`No BBGU direct API login state found. Set BBGU_ACCESS_TOKEN/BBGU_COOKIE or enable BBGU_AUTO_LOGIN_ON_EXPIRED and run again.`);
-  }
-
   console.log('[BBGU] No saved direct API token found; starting automatic QR login renewal.');
-  const currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn });
+  await runLoginFn(config, { ignoreInitialAccessToken: true });
+  const auth = await readSavedAuthStateAfterLoginFn(config.tokenPath);
+  if (!auth.accessToken) {
+    throw new Error(`Automatic login completed but no token was saved at ${config.tokenPath}.`);
+  }
+  config.authorization = buildAuthorizationHeader(auth.accessToken);
+  const currentRows = await fetchScoreRowsFn(config);
   return finishGradeRun(currentRows);
 }
 
 async function runLogin(config = getConfig(), options = {}) {
   if (!config.pushplusToken) {
-    throw new Error('Missing PUSHPLUS_TOKEN. Set it in QingLong environment variables.');
+    throw new Error('Missing PUSHPLUS_TOKEN. Set it in GitHub repository secrets.');
   }
 
   return withBrowserContext(config, createContext, async (context) => {
@@ -2289,7 +1992,7 @@ async function runLogin(config = getConfig(), options = {}) {
       throw new Error(`BBGU login page failed to load in Chromium. Diagnostic report: ${diagnostic.reportPath}; screenshot: ${diagnostic.screenshotPath}`);
     }
 
-    let token = ignoreInitialAccessToken ? '' : await extractAccessTokenFromPage(page);
+    let token = ignoreInitialAccessToken ? '' : (await extractAuthStateFromPage(page)).accessToken;
     if (!token && !(await isAuthenticated(page))) {
       const pageScreenshotPath = await saveScreenshot(page, config, 'qr-login');
       const weixinQrInfo = await weixinQrCapture.wait(5000) || await fetchWeixinQrInfoFromPage(page);
@@ -2349,21 +2052,7 @@ async function runLogin(config = getConfig(), options = {}) {
     weixinQrCapture.stop();
     await saveBrowserAuthState(page, config);
     await context.storageState({ path: config.storageStatePath });
-    await clearAuthExpiredState(config);
     await clearQrReminderState(config);
-    if (config.notifyLoginUpdated) {
-      await sendPushPlus({
-        token: config.pushplusToken,
-        title: 'BBGU 登录态已更新',
-        content: [
-          '# BBGU 登录态已更新',
-          '',
-          `Token 已保存到：\`${config.tokenPath}\``,
-          '',
-          '后续成绩监控任务会自动读取这个 token。',
-        ].join('\n'),
-      });
-    }
     console.log(`[BBGU] Access token saved: ${config.tokenPath}`);
     console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
     return { status: 'login_ok', tokenPath: config.tokenPath };
@@ -2389,7 +2078,6 @@ async function maybeRunScheduledQr(config, deps = {}) {
   })) {
     return { status: 'qr_pending', ...state };
   }
-  if (!config.autoLoginOnExpired) return { status: 'qr_pending', ...state };
   await saveQrReminderScheduleFn(config, { ...state, lastPushedAt: nowMs });
   const result = await runLoginFn(config, { ignoreInitialAccessToken: true });
   await clearQrReminderStateFn(config);
@@ -2473,63 +2161,13 @@ async function runRenew(config = getConfig(), deps = {}) {
   return maybeRunScheduledQrFn(config, { nowFn });
 }
 
-async function runCasDiagnose(config = getConfig()) {
-  const before = await collectCasDiagnosticSnapshot(config);
-  let renewResult;
-  try {
-    renewResult = await runSilentRenew(config);
-  } catch (error) {
-    renewResult = { status: 'renew_failed', error: error && error.message ? error.message : String(error) };
-  }
-  const after = await collectCasDiagnosticSnapshot(config);
-  console.log(formatCasDiagnostics({ before, after, renewResult }));
-  if (renewResult.status === 'renew_failed') {
-    console.log(`\nSilent renew error: ${renewResult.error}`);
-  }
-  return { status: 'cas_diagnose_ok', before, after, renewResult };
-}
-
-async function runLoginDebug(config = getConfig()) {
-  const createDebugContext = (browser) => browser.newContext({
-    viewport: { width: 1440, height: 1000 },
-    locale: 'zh-CN',
-    timezoneId: 'Asia/Shanghai',
-  });
-
-  return withBrowserContext(config, createDebugContext, async (context) => {
-    const page = await context.newPage();
-    console.log(`[BBGU] Opening ${config.homeUrl} for login debug without saved storage state.`);
-    await navigateToLoginPage(page, config.homeUrl);
-    await page.waitForTimeout(5000);
-
-    const diagnostic = await saveLoginDebugReport(page, config);
-    const classified = diagnostic.report.classified;
-    console.log(`[BBGU] Login debug report saved: ${diagnostic.reportPath}`);
-    console.log(`[BBGU] Login debug screenshot saved: ${diagnostic.screenshotPath}`);
-    console.log(`[BBGU] mobile OAuth candidates: ${classified.mobileOauthCandidates.length}`);
-    for (const url of classified.mobileOauthCandidates) {
-      console.log(`[BBGU] MOBILE_OAUTH ${url}`);
-    }
-    console.log(`[BBGU] QRConnect URLs: ${classified.qrConnectUrls.length}`);
-    for (const url of classified.qrConnectUrls.slice(0, 5)) {
-      console.log(`[BBGU] QRCONNECT ${url}`);
-    }
-    console.log(`[BBGU] other login URLs: ${classified.otherLoginUrls.length}`);
-    return { status: 'login_debug_ok', reportPath: diagnostic.reportPath, screenshotPath: diagnostic.screenshotPath };
-  });
-}
-
 if (require.main === module) {
   const mode = process.argv[2] || 'run';
   const entry = mode === 'login'
     ? runLogin
-    : mode === 'login-debug'
-      ? runLoginDebug
-      : mode === 'renew'
-        ? runRenew
-        : mode === 'cas-diagnose'
-          ? runCasDiagnose
-          : run;
+    : mode === 'renew'
+      ? runRenew
+      : run;
   entry().catch((error) => {
     console.error('[BBGU] Script failed:', error && error.stack ? error.stack : util.inspect(error));
     process.exitCode = 1;
@@ -2540,15 +2178,12 @@ module.exports = {
   clean,
   buildAuthorizationHeader,
   parseSavedAuthState,
-  parseSavedAccessToken,
   extractAuthStateFromStorageState,
   decodeJwtPayload,
   extractJwtExpiry,
   formatAuthStatusSummary,
   computeQrSchedule,
   shouldPushQrNow,
-  summarizeCasCookies,
-  formatCasDiagnostics,
   normalizeGradeRows,
   diffGrades,
   normalizeSubScoreList,
@@ -2559,7 +2194,6 @@ module.exports = {
   formatGradeNotification,
   formatPushPlusGradeTextContent,
   calculateTermArithmeticAverage,
-  formatAuthExpiredMessage,
   buildWeixinQrConfirmUrl,
   renderTerminalQrCode,
   decodeQrPayloadFromPngFile,
@@ -2569,9 +2203,6 @@ module.exports = {
   saveLoginTimeoutDiagnostics,
   saveQrElementScreenshot,
   isLikelyQrLoginUrl,
-  extractLoginDebugUrlsFromHtml,
-  classifyLoginDebugUrls,
-  formatNoChangeMessage,
   sendPushPlus,
   parseBooleanEnv,
   parsePositiveIntegerEnv,
@@ -2581,9 +2212,7 @@ module.exports = {
   normalizeBbguScoreApiData,
   getConfig,
   readSavedAuthState,
-  readSavedAccessToken,
   saveAuthState,
-  saveAccessToken,
   readQrReminderState,
   saveQrReminderSchedule,
   markCasExpired,
@@ -2593,8 +2222,6 @@ module.exports = {
   refreshAndSaveAuthState,
   extractWeixinQrInfoFromHtml,
   extractWeixinQrConnectUrlFromHtml,
-  collectLoginDebugInfo,
-  saveLoginDebugReport,
   fetchWeixinQrInfoFromPage,
   extractAuthStateFromPage,
   saveBrowserAuthState,
@@ -2607,11 +2234,9 @@ module.exports = {
   runSilentRenew,
   maybeRunScheduledQr,
   runRenew,
-  runCasDiagnose,
   recoverDirectApiAfterAuthExpired,
-  fetchBbguScoreRowsWithCookie,
+  fetchBbguScoreRows,
   requestJsonText,
   run,
   runLogin,
-  runLoginDebug,
 };

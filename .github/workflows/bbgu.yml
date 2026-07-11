@@ -8,7 +8,7 @@ on:
         required: true
         default: watch
         type: choice
-        options: [watch, renew, login, watch-reset]
+        options: [watch, renew, login, watch-reset, subscore-test]
   schedule:
     - cron: '7 10-22 * * *'
       timezone: Asia/Shanghai
@@ -79,6 +79,7 @@ jobs:
           CLASH_SUBSCRIPTION_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
           BBGU_PROXY_FILTER: ${{ secrets.BBGU_PROXY_FILTER }}
           BBGU_PROXY_EXCLUDE: ${{ secrets.BBGU_PROXY_EXCLUDE }}
+          BBGU_RUN_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           if [[ -z "${CLASH_SUBSCRIPTION_URL:-}" ]]; then
@@ -212,6 +213,22 @@ jobs:
             saved_proxy="$(node -e 'try { const state = require(process.argv[1]); process.stdout.write(String(state.selectedProxy || "")); } catch {}' "$proxy_state_path")"
           fi
 
+          if [[ "${BBGU_RUN_MODE:-}" == 'subscore-test' ]]; then
+            if [[ -z "$saved_proxy" ]]; then
+              echo '[BBGU] subscore-test需要已保存的粘性节点，本次不自动选择新节点。' >&2
+              exit 1
+            fi
+            if ! grep -Fxq "$saved_proxy" <<< "$candidates"; then
+              echo "[BBGU] 已保存的粘性节点不在当前候选列表，本次不切换节点：$saved_proxy" >&2
+              exit 1
+            fi
+            if ! set_group_proxy "$saved_proxy"; then
+              exit 1
+            fi
+            echo "[BBGU] subscore-test固定使用原粘性节点，不执行预检或候选切换：$saved_proxy"
+            exit 0
+          fi
+
           if [[ -n "$saved_proxy" ]]; then
             echo "[BBGU] 沿用上次可用节点：$saved_proxy"
             if grep -Fxq "$saved_proxy" <<< "$candidates"; then
@@ -269,6 +286,7 @@ jobs:
           case "$mode" in
             renew) node bbgu_grade_watch.js renew ;;
             login) node bbgu_grade_watch.js login ;;
+            subscore-test) node bbgu_grade_watch.js subscore-test ;;
             watch-reset)
               rm -f "$BBGU_DATA_DIR/bbgu_grade_snapshot.json"
               echo '[BBGU] 已清空成绩快照，本次watch会把现有成绩视为新增。'
@@ -288,7 +306,7 @@ jobs:
           retention-days: 1
 
       - name: 加密并保存状态
-        if: always()
+        if: always() && !(github.event_name == 'workflow_dispatch' && inputs.mode == 'subscore-test')
         env:
           BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
           BBGU_STATE_BASE_SHA: ${{ steps.restore_state.outputs.state_remote_sha }}
@@ -330,7 +348,7 @@ jobs:
           git -C "$state_worktree" push --force-with-lease="$state_lease" origin HEAD:state
 
       - name: Mihomo诊断日志
-        if: steps.run_bbgu.outcome == 'failure'
+        if: steps.run_bbgu.outcome == 'failure' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'subscore-test')
         run: docker logs --tail 100 bbgu-mihomo 2>&1 || true
 
       - name: 停止Mihomo

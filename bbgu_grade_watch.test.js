@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 
 const bbguGradeWatch = require('./bbgu_grade_watch');
 const {
@@ -14,6 +15,9 @@ const {
   mergePersistedSubScores,
   selectRowsForSubScoreFetch,
   enrichRowsWithSubScores,
+  diagnoseBbguSubscore,
+  runSubscoreDiagnostic,
+  requestJsonTextWithHttpsProxy,
   sendPushPlus,
   fetchWithTimeout,
   parseBooleanEnv,
@@ -682,6 +686,179 @@ test('normalizeSubScoreList extracts score form subscore rows', () => {
     { name: '平时成绩', weight: '30', score: '80' },
     { name: '期末成绩', weight: '70', score: '50' },
   ]);
+});
+
+test('平时分诊断在fetch连接重置后通过同一代理原生HTTPS重试', async () => {
+  const logs = [];
+  const proxyCalls = [];
+  const accessToken = 'secret.access.token';
+  const resetCause = Object.assign(new Error('read ECONNRESET'), {
+    code: 'ECONNRESET',
+    errno: -4077,
+    syscall: 'read',
+  });
+
+  const result = await diagnoseBbguSubscore('score-1', {
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: `Bearer ${accessToken}`,
+    proxyServer: 'http://127.0.0.1:7890',
+  }, {
+    fetchFn: async () => {
+      throw Object.assign(new TypeError('fetch failed'), { cause: resetCause });
+    },
+    proxyHttpsRequestFn: async (url, headers, proxyServer) => {
+      proxyCalls.push({ url, headers, proxyServer });
+      return {
+        status: 200,
+        text: JSON.stringify({
+          status: 'success',
+          data: { subScoreList: [{ scoreName: '平时成绩', weight: 20, score: 88 }] },
+        }),
+        via: 'proxy-https',
+      };
+    },
+    logFn: (message) => logs.push(String(message)),
+  });
+
+  assert.equal(result.transport, 'proxy-https');
+  assert.equal(result.httpStatus, 200);
+  assert.deepEqual(result.subScores, [{ name: '平时成绩', weight: '20', score: '88' }]);
+  assert.equal(proxyCalls.length, 1);
+  assert.equal(proxyCalls[0].url, 'https://zhjw.bbgu.edu.cn/api/sam/scoreManage/stu-score-form?scoreId=score-1');
+  assert.equal(proxyCalls[0].proxyServer, 'http://127.0.0.1:7890');
+  assert.equal(proxyCalls[0].headers.authorization, `Bearer ${accessToken}`);
+  assert.match(logs.join('\n'), /transport=fetch.*stage=fetch.*ECONNRESET/);
+  assert.match(logs.join('\n'), /transport=proxy-https.*HTTP=200/);
+  assert.equal(logs.join('\n').includes(accessToken), false);
+});
+
+test('平时分诊断收到HTTP响应时不重复请求同一接口', async () => {
+  let proxyCalls = 0;
+
+  await assert.rejects(diagnoseBbguSubscore('score-2', {
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: 'Bearer expired.access',
+    proxyServer: 'http://127.0.0.1:7890',
+  }, {
+    fetchFn: async () => new Response(JSON.stringify({ status: 'error', message: 'unauthorized' }), {
+      status: 403,
+      headers: { 'content-type': 'application/json' },
+    }),
+    proxyHttpsRequestFn: async () => {
+      proxyCalls += 1;
+      throw new Error('must not retry an HTTP response');
+    },
+    logFn: () => undefined,
+  }), (error) => error && error.code === 'BBGU_AUTH_EXPIRED');
+
+  assert.equal(proxyCalls, 0);
+});
+
+test('平时分诊断不把HTTP响应正文写入错误', async () => {
+  const responseSecret = 'Bearer response-body-secret';
+  let proxyCalls = 0;
+
+  await assert.rejects(diagnoseBbguSubscore('score-3', {
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: 'Bearer request-secret',
+    proxyServer: 'http://127.0.0.1:7890',
+  }, {
+    fetchFn: async () => new Response(responseSecret, { status: 502 }),
+    proxyHttpsRequestFn: async () => {
+      proxyCalls += 1;
+      throw new Error('must not retry an HTTP response');
+    },
+    logFn: () => undefined,
+  }), (error) => {
+    assert.equal(String(error && error.message).includes(responseSecret), false);
+    assert.match(String(error && error.message), /HTTP 502.*bodyLength=/);
+    return true;
+  });
+
+  assert.equal(proxyCalls, 0);
+});
+
+test('代理原生HTTPS在响应体中断时报告response-body阶段', async () => {
+  const socket = new EventEmitter();
+  socket.setTimeout = () => undefined;
+  socket.destroy = () => undefined;
+  socket.unshift = () => undefined;
+  socket.write = () => queueMicrotask(() => {
+    socket.emit('data', Buffer.from('HTTP/1.1 200 Connection Established\r\n\r\n'));
+  });
+
+  const secureSocket = new EventEmitter();
+  const response = new EventEmitter();
+  response.statusCode = 200;
+  response.complete = false;
+  response.setEncoding = () => undefined;
+
+  const request = new EventEmitter();
+  request.destroy = (error) => request.emit('error', error);
+  request.end = () => queueMicrotask(() => {
+    response.emit('data', 'partial');
+    response.emit('aborted');
+    response.emit('close');
+  });
+
+  await assert.rejects(requestJsonTextWithHttpsProxy(
+    'https://zhjw.bbgu.edu.cn/api/sam/scoreManage/stu-score-form?scoreId=score-4',
+    { authorization: 'Bearer secret' },
+    'http://127.0.0.1:7890',
+    {
+      netConnectFn: (_options, onConnect) => {
+        queueMicrotask(onConnect);
+        return socket;
+      },
+      tlsConnectFn: (_options, onSecure) => {
+        queueMicrotask(onSecure);
+        return secureSocket;
+      },
+      httpsRequestFn: (_options, onResponse) => {
+        queueMicrotask(() => onResponse(response));
+        return request;
+      },
+    }
+  ), (error) => error && error.stage === 'response-body' && /aborted/i.test(error.message));
+});
+
+test('subscore-test自动选择最近失败课程且不要求PushPlus', async () => {
+  const logs = [];
+  const calls = [];
+  const config = {
+    tokenPath: 'token.env',
+    snapshotPath: 'snapshot.json',
+    authorization: '',
+    pushplusToken: '',
+  };
+
+  const result = await runSubscoreDiagnostic(config, {
+    readSavedAuthStateFn: async () => ({ accessToken: 'saved.access.token', refreshToken: '' }),
+    readSnapshotFn: async () => [
+      {
+        courseName: '较早失败课程',
+        scoreId: 'old-score',
+        subScoreFetchError: 'fetch failed',
+        subScoreFetchedAt: '2026-07-11T01:00:00.000Z',
+      },
+      {
+        courseName: '传感器与测试技术',
+        scoreId: 'new-score',
+        subScoreFetchError: 'fetch failed',
+        subScoreFetchedAt: '2026-07-11T02:00:00.000Z',
+      },
+    ],
+    diagnoseSubscoreFn: async (scoreId, nextConfig) => {
+      calls.push({ scoreId, authorization: nextConfig.authorization });
+      return { transport: 'proxy-https', httpStatus: 200, subScores: [] };
+    },
+    logFn: (message) => logs.push(String(message)),
+  });
+
+  assert.deepEqual(calls, [{ scoreId: 'new-score', authorization: 'Bearer saved.access.token' }]);
+  assert.equal(result.status, 'subscore_diagnostic_ok');
+  assert.equal(result.courseName, '传感器与测试技术');
+  assert.equal(logs.join('\n').includes('saved.access.token'), false);
 });
 
 test('mergePersistedSubScores keeps previous subscore details for unchanged courses', () => {

@@ -1417,24 +1417,125 @@ async function fetchBbguSubScores(scoreId, config) {
   const origin = getBbguOrigin(config);
   const url = `${origin}${BBGU_SUBSCORE_API_PATH}?scoreId=${encodeURIComponent(scoreId)}`;
   const response = await requestJsonText(url, buildBbguApiHeaders(config, '/sam/home'));
+  return parseBbguSubscoreResponse(response);
+}
+
+function parseBbguSubscoreResponse(response, options = {}) {
+  const includeBodyInError = options.includeBodyInError !== false;
+  const responseText = String(response.text || '');
+  const errorDetails = (limit) => includeBodyInError
+    ? responseText.slice(0, limit)
+    : `bodyLength=${Buffer.byteLength(responseText, 'utf8')}`;
   let body;
   try {
-    body = JSON.parse(response.text);
+    body = JSON.parse(responseText);
   } catch {
-    throw new Error(`BBGU subscore API returned non-JSON HTTP ${response.status}: ${response.text.slice(0, 300)}`);
+    throw new Error(`BBGU subscore API returned non-JSON HTTP ${response.status}: ${errorDetails(300)}`);
   }
 
-  if (isAuthExpiredResponse({ httpStatus: response.status, text: response.text, body })) {
+  if (isAuthExpiredResponse({ httpStatus: response.status, text: responseText, body })) {
     const error = new Error('BBGU login state expired while fetching subscore.');
     error.code = 'BBGU_AUTH_EXPIRED';
     throw error;
   }
 
   if (response.status < 200 || response.status >= 300 || body.status !== 'success') {
-    throw new Error(`BBGU subscore API failed HTTP ${response.status}: ${response.text.slice(0, 500)}`);
+    throw new Error(`BBGU subscore API failed HTTP ${response.status}: ${errorDetails(500)}`);
   }
 
   return normalizeSubScoreList(body);
+}
+
+function formatDiagnosticError(error) {
+  const parts = [];
+  const seen = new Set();
+  let current = error;
+
+  while (current && !seen.has(current) && parts.length < 6) {
+    seen.add(current);
+    const name = clean(current.name) || 'Error';
+    const stage = clean(current.stage);
+    const code = clean(current.code);
+    const errno = clean(current.errno);
+    const syscall = clean(current.syscall);
+    const metadata = [stage ? `stage=${stage}` : '', code, errno ? `errno=${errno}` : '', syscall ? `syscall=${syscall}` : '']
+      .filter(Boolean)
+      .join(' ');
+    const message = clean(current.message || current)
+      .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+      .replace(/\beyJ[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*){1,2}\b/g, '[JWT REDACTED]');
+    parts.push(`${name}${metadata ? ` [${metadata}]` : ''}: ${message}`);
+    current = current.cause;
+  }
+
+  return parts.join(' <- ') || 'Unknown error';
+}
+
+function createStagedNetworkError(stage, error) {
+  if (error && error.stage) return error;
+  const message = clean(error && error.message ? error.message : error) || 'Unknown network error';
+  const stagedError = new Error(`${stage}: ${message}`, error instanceof Error ? { cause: error } : undefined);
+  stagedError.stage = stage;
+  if (error && error.code) stagedError.code = error.code;
+  if (error && error.errno !== undefined) stagedError.errno = error.errno;
+  if (error && error.syscall) stagedError.syscall = error.syscall;
+  return stagedError;
+}
+
+async function diagnoseBbguSubscore(scoreId, config, deps = {}) {
+  const fetchFn = deps.fetchFn || fetch;
+  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const logFn = deps.logFn || console.log;
+  const timeoutMs = deps.timeoutMs || BBGU_API_TIMEOUT_MS;
+  const origin = getBbguOrigin(config);
+  const url = `${origin}${BBGU_SUBSCORE_API_PATH}?scoreId=${encodeURIComponent(scoreId)}`;
+  const endpoint = new URL(url).pathname;
+  const headers = buildBbguApiHeaders(config, '/sam/home');
+  let response;
+  let primaryError = '';
+
+  try {
+    const fetched = await fetchWithTimeout(
+      async (targetUrl, options) => {
+        const fetchResponse = await fetchFn(targetUrl, options);
+        return { response: fetchResponse, text: await fetchResponse.text() };
+      },
+      url,
+      { method: 'GET', headers },
+      timeoutMs,
+      '平时分诊断请求'
+    );
+    response = { status: fetched.response.status, text: fetched.text, via: 'fetch' };
+    logFn(`[BBGU] Subscore diagnostic transport=fetch endpoint=${endpoint} HTTP=${response.status}`);
+  } catch (error) {
+    primaryError = formatDiagnosticError(createStagedNetworkError('fetch', error));
+    logFn(`[BBGU] Subscore diagnostic transport=fetch endpoint=${endpoint} failed: ${primaryError}`);
+    if (!config.proxyServer) {
+      const proxyError = new Error('Subscore diagnostic cannot retry safely because BBGU_PROXY_SERVER is missing.');
+      proxyError.code = 'BBGU_SUBSCORE_DIAGNOSTIC_PROXY_REQUIRED';
+      throw proxyError;
+    }
+
+    try {
+      response = await proxyHttpsRequestFn(url, headers, config.proxyServer);
+      logFn(`[BBGU] Subscore diagnostic transport=proxy-https endpoint=${endpoint} HTTP=${response.status}`);
+    } catch (fallbackError) {
+      const fallbackDetails = formatDiagnosticError(createStagedNetworkError('proxy-https', fallbackError));
+      logFn(`[BBGU] Subscore diagnostic transport=proxy-https endpoint=${endpoint} failed: ${fallbackDetails}`);
+      const combinedError = new Error(`Subscore diagnostic failed on both same-node transports. fetch=${primaryError}; proxy-https=${fallbackDetails}`);
+      combinedError.code = 'BBGU_SUBSCORE_DIAGNOSTIC_FAILED';
+      throw combinedError;
+    }
+  }
+
+  const subScores = parseBbguSubscoreResponse(response, { includeBodyInError: false });
+  logFn(`[BBGU] Subscore diagnostic succeeded. transport=${response.via || 'proxy-https'} HTTP=${response.status} count=${subScores.length}`);
+  return {
+    transport: response.via || 'proxy-https',
+    httpStatus: response.status,
+    subScores,
+    ...(primaryError ? { primaryError } : {}),
+  };
 }
 
 async function enrichRowsWithSubScores(diff, config, fetcher = fetchBbguSubScores) {
@@ -1546,9 +1647,48 @@ function requestJsonTextWithHttps(url, headers) {
   });
 }
 
-function requestJsonTextWithHttpsProxy(url, headers, proxyServer) {
+function readHttpResponseText(response, stage = 'response-body') {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let settled = false;
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(createStagedNetworkError(stage, error));
+    };
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        status: response.statusCode || 0,
+        text: chunks.join(''),
+      });
+    };
+
+    response.setEncoding('utf8');
+    response.on('data', (chunk) => chunks.push(chunk));
+    response.once('end', finishResolve);
+    response.once('aborted', () => {
+      const error = new Error('HTTP response aborted before completion');
+      error.code = 'ERR_HTTP_RESPONSE_ABORTED';
+      finishReject(error);
+    });
+    response.once('error', finishReject);
+    response.once('close', () => {
+      if (settled) return;
+      const error = new Error('HTTP response closed before completion');
+      error.code = 'ERR_HTTP_RESPONSE_INCOMPLETE';
+      finishReject(error);
+    });
+  });
+}
+
+function requestJsonTextWithHttpsProxy(url, headers, proxyServer, deps = {}) {
   const target = new URL(url);
   const proxy = new URL(proxyServer);
+  const netConnectFn = deps.netConnectFn || net.connect;
+  const tlsConnectFn = deps.tlsConnectFn || tls.connect;
+  const httpsRequestFn = deps.httpsRequestFn || https.request;
   if (target.protocol !== 'https:') {
     return Promise.reject(new Error(`Proxy HTTPS fallback only supports https URLs: ${target.protocol}`));
   }
@@ -1574,21 +1714,26 @@ function requestJsonTextWithHttpsProxy(url, headers, proxyServer) {
     let settled = false;
     let socket;
     let connectBuffer = Buffer.alloc(0);
+    let networkStage = 'proxy-tcp';
     const finishReject = (error) => {
       if (settled) return;
       settled = true;
       if (socket) socket.destroy();
       reject(error);
     };
+    const failAtStage = (stage, error) => {
+      finishReject(createStagedNetworkError(stage, error));
+    };
 
-    socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
+    socket = netConnectFn({ host: proxyHost, port: proxyPort }, () => {
+      networkStage = 'connect';
       socket.write(`${proxyHeaders.join('\r\n')}\r\n\r\n`);
     });
     socket.setTimeout(30000, () => {
-      finishReject(new Error('Proxy CONNECT timeout after 30000ms'));
+      failAtStage(networkStage, new Error('Proxy connection timeout after 30000ms'));
     });
     socket.on('error', (error) => {
-      finishReject(error);
+      failAtStage(networkStage, error);
     });
     socket.on('data', function onConnectData(chunk) {
       connectBuffer = Buffer.concat([connectBuffer, chunk]);
@@ -1601,17 +1746,19 @@ function requestJsonTextWithHttpsProxy(url, headers, proxyServer) {
       const statusMatch = headerText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/i);
       const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
       if (statusCode !== 200) {
-        finishReject(new Error(`Proxy CONNECT failed with status ${statusCode || 'unknown'}`));
+        failAtStage('connect', new Error(`Proxy CONNECT failed with status ${statusCode || 'unknown'}`));
         return;
       }
       if (leftover.length) socket.unshift(leftover);
 
-      const secureSocket = tls.connect({
+      networkStage = 'target-tls';
+      const secureSocket = tlsConnectFn({
         socket,
         servername: target.hostname,
         ALPNProtocols: ['http/1.1'],
       }, () => {
-        const request = https.request({
+        networkStage = 'request';
+        const request = httpsRequestFn({
           protocol: 'https:',
           hostname: target.hostname,
           port: targetPort,
@@ -1623,30 +1770,28 @@ function requestJsonTextWithHttpsProxy(url, headers, proxyServer) {
           createConnection: () => secureSocket,
           insecureHTTPParser: true,
         }, (response) => {
-          const chunks = [];
-          response.setEncoding('utf8');
-          response.on('data', (responseChunk) => chunks.push(responseChunk));
-          response.on('end', () => {
+          networkStage = 'response-body';
+          readHttpResponseText(response, 'response-body').then(({ status, text }) => {
             if (settled) return;
             settled = true;
             resolve({
-              status: response.statusCode || 0,
-              text: chunks.join(''),
+              status,
+              text,
               via: 'proxy-https',
             });
-          });
+          }).catch(finishReject);
         });
 
         request.on('timeout', () => {
-          request.destroy(new Error('Proxy HTTPS request timeout after 30000ms'));
+          request.destroy(createStagedNetworkError(networkStage, new Error('Proxy HTTPS request timeout after 30000ms')));
         });
         request.on('error', (error) => {
-          finishReject(error);
+          failAtStage(networkStage, error);
         });
         request.end();
       });
       secureSocket.on('error', (error) => {
-        finishReject(error);
+        failAtStage(networkStage, error);
       });
     });
   });
@@ -2031,6 +2176,52 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
   return fetchScoreRowsFn(config);
 }
 
+async function runSubscoreDiagnostic(config = getConfig(), deps = {}) {
+  const readSavedAuthStateFn = deps.readSavedAuthStateFn || readSavedAuthState;
+  const readSnapshotFn = deps.readSnapshotFn || ((snapshotPath) => readJson(snapshotPath, []));
+  const diagnoseSubscoreFn = deps.diagnoseSubscoreFn || diagnoseBbguSubscore;
+  const logFn = deps.logFn || console.log;
+
+  if (!config.authorization) {
+    const auth = await readSavedAuthStateFn(config.tokenPath);
+    if (!auth.accessToken) {
+      throw new Error(`平时分诊断需要已保存的Access Token：${config.tokenPath}`);
+    }
+    config.authorization = buildAuthorizationHeader(auth.accessToken);
+  }
+
+  const snapshot = await readSnapshotFn(config.snapshotPath);
+  const failedRows = (Array.isArray(snapshot) ? snapshot : [])
+    .filter((row) => row && row.scoreId && row.subScoreFetchError);
+  if (!failedRows.length) {
+    throw new Error('成绩快照中没有带scoreId的平时分失败记录，无需执行subscore-test。');
+  }
+
+  const target = failedRows.reduce((latest, row) => {
+    if (!latest) return row;
+    const latestTime = Date.parse(latest.subScoreFetchedAt || '') || 0;
+    const rowTime = Date.parse(row.subScoreFetchedAt || '') || 0;
+    return rowTime > latestTime ? row : latest;
+  }, null);
+  const courseName = clean(target.courseName || target.key) || '未知课程';
+  logFn(`[BBGU] Subscore diagnostic target: ${courseName}; scoreId=${target.scoreId}`);
+
+  const diagnostic = await diagnoseSubscoreFn(target.scoreId, config, { logFn });
+  for (const item of diagnostic.subScores || []) {
+    logFn(`[BBGU] Subscore diagnostic item: ${clean(item.name) || '未命名项目'}; weight=${clean(item.weight) || '-'}; score=${clean(item.score) || '-'}`);
+  }
+  if (!diagnostic.subScores || !diagnostic.subScores.length) {
+    logFn('[BBGU] Subscore diagnostic returned an empty detail list.');
+  }
+
+  return {
+    status: 'subscore_diagnostic_ok',
+    courseName,
+    scoreId: target.scoreId,
+    ...diagnostic,
+  };
+}
+
 async function run(config = getConfig(), deps = {}) {
   const {
     readSavedAuthStateFn = readSavedAuthState,
@@ -2326,7 +2517,9 @@ if (require.main === module) {
     ? runLogin
     : mode === 'renew'
       ? runRenew
-      : run;
+      : mode === 'subscore-test'
+        ? runSubscoreDiagnostic
+        : run;
   entry().catch((error) => {
     console.error('[BBGU] Script failed:', error && error.stack ? error.stack : util.inspect(error));
     process.exitCode = 1;
@@ -2351,6 +2544,8 @@ module.exports = {
   selectRowsForSubScoreFetch,
   enrichRowsWithSubScores,
   fetchBbguSubScores,
+  diagnoseBbguSubscore,
+  runSubscoreDiagnostic,
   formatGradeNotification,
   formatPushPlusGradeTextContent,
   calculateTermArithmeticAverage,
@@ -2399,6 +2594,7 @@ module.exports = {
   recoverDirectApiAfterAuthExpired,
   fetchBbguScoreRows,
   requestJsonText,
+  requestJsonTextWithHttpsProxy,
   run,
   runLogin,
 };

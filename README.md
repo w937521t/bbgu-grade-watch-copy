@@ -134,6 +134,8 @@ bbgu-state.enc
 
 如需临时验证已出成绩是否能触发新增通知和平时分明细查询，可手动运行 `watch-reset`。该模式只删除本次 Runner 恢复出的 `bbgu_grade_snapshot.json`，不会删除 Token、Cookie 或浏览器登录态；随后按 `watch` 执行一次，并把现有成绩视为新增。
 
+如日志出现 `Subscore fetch failed`，可手动运行 `subscore-test`。该模式会从成绩快照中自动选择最近一次平时分读取失败且带有 `scoreId` 的课程：先使用 Node.js `fetch`，仅在连接或解析阶段失败时，再通过同一个 Mihomo 节点使用原生 HTTPS 重试一次。它不会切换节点、发送 PushPlus、修改成绩快照或更新 `state` 分支；运行日志会显示两种传输结果和本次 Mihomo 日志，但不会输出 Access Token。
+
 ## 七、定时规则
 
 成绩查询：

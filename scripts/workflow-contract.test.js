@@ -171,3 +171,10 @@ test('Workflow不预检学校端点并在主任务失败时输出Mihomo日志', 
   assert.match(yaml, /if: steps\.run_bbgu\.outcome == 'failure'/);
   assert.match(yaml, /docker logs --tail 100 bbgu-mihomo/);
 });
+
+test('Workflow不通过curl或健康检查访问学校', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+  assert.doesNotMatch(yaml, /curl[^\n]*(?:zhjw|authserver)\.bbgu\.edu\.cn/i);
+  assert.doesNotMatch(yaml, /health-check:[\s\S]*?bbgu\.edu\.cn/i);
+  assert.doesNotMatch(yaml, /必要端点|测试候选节点/);
+});

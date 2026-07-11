@@ -6,7 +6,7 @@ const fsp = require('node:fs/promises');
 const https = require('node:https');
 const net = require('node:net');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const tls = require('node:tls');
 const util = require('node:util');
 
@@ -73,6 +73,11 @@ function unquoteToken(value) {
 function buildAuthorizationHeader(accessToken) {
   const token = unquoteToken(accessToken);
   return token ? `Bearer ${token}` : '';
+}
+
+function fingerprintToken(token) {
+  const normalized = unquoteToken(String(token || '').replace(/^Bearer\s+/i, ''));
+  return normalized ? createHash('sha256').update(normalized).digest('hex') : '';
 }
 
 async function fetchWithTimeout(fetchFn, url, options, timeoutMs, label) {
@@ -210,7 +215,9 @@ const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const QR_REMINDER_COOLDOWN_MS = 2 * HOUR_MS;
+const REFRESH_EXPIRY_SAFETY_MS = 30 * 60 * 1000;
 const GRADE_QUERY_MINUTE = 7;
+const ACCESS_LIFETIME_SECONDS = 12 * 60 * 60;
 
 function beijingTimeParts(epochMs) {
   const shifted = new Date(epochMs + BEIJING_OFFSET_MS);
@@ -252,6 +259,114 @@ function scheduledGradeQueriesFrom(nowMs, dayCount = 3) {
   return result;
 }
 
+function scheduledAutomaticRunsFrom(nowMs, dayCount = 3) {
+  const start = beijingTimeParts(nowMs);
+  const localDay = Date.UTC(start.year, start.month - 1, start.day);
+  const runs = [];
+  for (let offset = 0; offset < dayCount; offset += 1) {
+    const date = new Date(localDay + offset * DAY_MS);
+    const year = date.getUTCFullYear();
+    const month = date.getUTCMonth() + 1;
+    const day = date.getUTCDate();
+    for (let hour = 1; hour <= 23; hour += 2) {
+      runs.push({ mode: 'renew', at: beijingEpochMs(year, month, day, hour, 37) });
+    }
+    for (let hour = 10; hour <= 22; hour += 1) {
+      runs.push({ mode: 'watch', at: beijingEpochMs(year, month, day, hour, GRADE_QUERY_MINUTE) });
+    }
+  }
+  return runs
+    .filter((item) => item.at >= nowMs)
+    .sort((left, right) => left.at - right.at);
+}
+
+function firstUncoveredGradeQuery(accessExpiryEpochSeconds, nowMs) {
+  const expiryMs = accessExpiryEpochSeconds * 1000;
+  return scheduledGradeQueriesFrom(nowMs).find((queryAt) => queryAt >= expiryMs) || null;
+}
+
+function planRefreshAction({
+  mode,
+  nowMs,
+  accessExpiryEpochSeconds,
+  refreshExpiryEpochSeconds,
+}) {
+  const refreshExpiryMs = refreshExpiryEpochSeconds * 1000;
+  if (nowMs >= refreshExpiryMs) return { action: 'REFRESH_EXPIRED', reason: 'jwt-exp' };
+  if (mode === 'watch' && nowMs >= accessExpiryEpochSeconds * 1000) {
+    return { action: 'REFRESH_ACCESS', reason: 'current-watch-uncovered' };
+  }
+
+  const accessExpiryMs = accessExpiryEpochSeconds * 1000;
+  const laterOpportunity = scheduledAutomaticRunsFrom(nowMs + 1)
+    .find((item) => (
+      item.at <= refreshExpiryMs - REFRESH_EXPIRY_SAFETY_MS
+      && (item.mode === 'renew' || (item.mode === 'watch' && item.at >= accessExpiryMs))
+    ));
+  if (laterOpportunity) return { action: 'WAIT', reason: 'later-opportunity' };
+
+  const currentUncovered = firstUncoveredGradeQuery(accessExpiryEpochSeconds, nowMs);
+  const predictedUncovered = firstUncoveredGradeQuery(
+    nowMs / 1000 + ACCESS_LIFETIME_SECONDS,
+    nowMs
+  );
+  if (currentUncovered && predictedUncovered && predictedUncovered > currentUncovered) {
+    return { action: 'REFRESH_ACCESS', reason: 'last-beneficial-opportunity' };
+  }
+  return { action: 'WAIT', reason: 'no-additional-watch' };
+}
+
+function planAutomaticAction(state) {
+  const {
+    mode,
+    nowMs,
+    schoolBackoffUntil = 0,
+    casExpired = false,
+    refreshExpired = false,
+    accessExpiryEpochSeconds = 0,
+    refreshExpiryEpochSeconds = 0,
+    qrDueAt = 0,
+    qrLastPushedAt = 0,
+    hasAccessToken = accessExpiryEpochSeconds > 0,
+    hasRefreshToken = refreshExpiryEpochSeconds > 0,
+  } = state;
+
+  if (nowMs < schoolBackoffUntil) return { action: 'SKIP_BACKOFF' };
+  if (!hasAccessToken && !hasRefreshToken) {
+    return shouldPushQrNow({ nowMs, dueAtMs: 0, lastPushedAtMs: qrLastPushedAt })
+      ? { action: 'QR_LOGIN', reason: 'initial-login' }
+      : { action: 'WAIT_QR_DUE', reason: 'qr-cooldown' };
+  }
+  if (mode === 'renew' && !casExpired) return { action: 'CAS_RENEW' };
+  if (mode === 'watch' && nowMs < accessExpiryEpochSeconds * 1000) {
+    return { action: 'QUERY_SCORE' };
+  }
+  if (!accessExpiryEpochSeconds) {
+    return { action: 'FAIL_LOCAL_STATE', reason: 'missing-access-exp' };
+  }
+  if (!refreshExpired && !refreshExpiryEpochSeconds) {
+    return { action: 'FAIL_LOCAL_STATE', reason: 'missing-refresh-exp' };
+  }
+  if (!refreshExpired) {
+    const refreshPlan = planRefreshAction({
+      mode,
+      nowMs,
+      accessExpiryEpochSeconds,
+      refreshExpiryEpochSeconds,
+    });
+    if (refreshPlan.action === 'REFRESH_ACCESS') return refreshPlan;
+    if (refreshPlan.action === 'REFRESH_EXPIRED') {
+      return { action: 'MARK_REFRESH_EXPIRED', reason: refreshPlan.reason };
+    }
+    return { action: 'WAIT_REFRESH_WINDOW', reason: refreshPlan.reason };
+  }
+  if (!qrDueAt) return { action: 'SCHEDULE_QR' };
+  if (shouldPushQrNow({ nowMs, dueAtMs: qrDueAt, lastPushedAtMs: qrLastPushedAt })) {
+    return { action: 'QR_LOGIN' };
+  }
+  return { action: 'WAIT_QR_DUE' };
+}
+
 function computeQrSchedule(accessExpiryEpochSeconds, nowMs = Date.now()) {
   const expiryMs = Number(accessExpiryEpochSeconds) * 1000;
   const firstUncoveredQueryAt = scheduledGradeQueriesFrom(nowMs)
@@ -264,6 +379,14 @@ function computeQrSchedule(accessExpiryEpochSeconds, nowMs = Date.now()) {
     ? firstUncoveredQueryAt - 30 * 60 * 1000
     : firstUncoveredQueryAt - HOUR_MS;
   return { accessExpiryEpochSeconds, dueAt, firstUncoveredQueryAt };
+}
+
+function computeImmediateQrSchedule(accessExpiryEpochSeconds, nowMs = Date.now()) {
+  return {
+    ...computeQrSchedule(accessExpiryEpochSeconds, nowMs),
+    firstUncoveredQueryAt: nowMs,
+    dueAt: nowMs,
+  };
 }
 
 function shouldPushQrNow({ nowMs, dueAtMs, lastPushedAtMs = 0 }) {
@@ -459,6 +582,11 @@ function normalizeSubScoreList(payload) {
 }
 
 function hasSubScoreFetchRecord(row) {
+  if (row && row.subScoreFetchError === '本次因全局异常跳过'
+    && !row.subScoreFetchedAt
+    && !Array.isArray(row.subScores)) {
+    return false;
+  }
   return Array.isArray(row && row.subScores) || !!(row && (row.subScoreFetchedAt || row.subScoreFetchError));
 }
 
@@ -874,6 +1002,12 @@ async function saveQrReminderSchedule(config, schedule) {
     refreshExpired: Object.hasOwn(schedule, 'refreshExpired')
       ? Boolean(schedule.refreshExpired)
       : Boolean(previous && previous.refreshExpired),
+    accessRejectedAfterRefresh: Object.hasOwn(schedule, 'accessRejectedAfterRefresh')
+      ? Boolean(schedule.accessRejectedAfterRefresh)
+      : Boolean(previous && previous.accessRejectedAfterRefresh),
+    rejectedAccessFingerprint: Object.hasOwn(schedule, 'rejectedAccessFingerprint')
+      ? schedule.rejectedAccessFingerprint
+      : (previous && previous.rejectedAccessFingerprint) || '',
     accessExpiryEpochSeconds: schedule.accessExpiryEpochSeconds,
     dueAt: schedule.dueAt,
     firstUncoveredQueryAt: schedule.firstUncoveredQueryAt,
@@ -893,10 +1027,30 @@ async function markCasExpired(config) {
   return next;
 }
 
+async function markQrPushed(config, nowMs = Date.now(), deps = {}) {
+  if (!config.qrReminderStatePath) return { lastPushedAt: nowMs };
+  const readQrReminderStateFn = deps.readQrReminderStateFn || readQrReminderState;
+  const writeJsonFn = deps.writeJsonFn || writeJson;
+  const previous = await readQrReminderStateFn(config) || {};
+  const next = { ...previous, lastPushedAt: nowMs };
+  await writeJsonFn(config.qrReminderStatePath, next);
+  return next;
+}
+
 async function markRefreshExpired(config) {
   if (!config || !config.qrReminderStatePath) return { refreshExpired: true };
   const previous = await readQrReminderState(config) || {};
   const next = { ...previous, refreshExpired: true };
+  await writeJson(config.qrReminderStatePath, next);
+  return next;
+}
+
+async function markAccessRejectedAfterRefresh(config, accessToken) {
+  const rejectedAccessFingerprint = fingerprintToken(accessToken);
+  const marker = { accessRejectedAfterRefresh: true, rejectedAccessFingerprint };
+  if (!config || !config.qrReminderStatePath) return marker;
+  const previous = await readQrReminderState(config) || {};
+  const next = { ...previous, ...marker };
   await writeJson(config.qrReminderStatePath, next);
   return next;
 }
@@ -1216,38 +1370,46 @@ function retryAfterDeadline(value, nowMs) {
   return Number.isFinite(parsed) && parsed > nowMs ? parsed : nowMs + 2 * HOUR_MS;
 }
 
-async function markSchoolBackoff(config, error, nowMs = Date.now()) {
-  if (!config.networkStatePath) return;
-  const previous = await readJson(config.networkStatePath, {});
+async function markSchoolBackoff(config, error, nowMs = Date.now(), deps = {}) {
+  if (!config.networkStatePath) return false;
   const httpStatus = Number(error && error.httpStatus);
-  if (httpStatus === 429) {
-    await writeJson(config.networkStatePath, {
-      ...previous,
-      schoolBackoffUntil: retryAfterDeadline(error && error.retryAfter, nowMs),
-      schoolBackoffStatus: httpStatus,
-      failedAt: nowMs,
-    });
-    return;
+  if (![429, 500, 503].includes(httpStatus)) return false;
+  const readJsonFn = deps.readJsonFn || readJson;
+  const writeJsonFn = deps.writeJsonFn || writeJson;
+  const previous = await readJsonFn(config.networkStatePath, {});
+  await writeJsonFn(config.networkStatePath, {
+    ...previous,
+    schoolBackoffUntil: httpStatus === 429
+      ? retryAfterDeadline(error && error.retryAfter, nowMs)
+      : nowMs + HOUR_MS,
+    schoolBackoffStatus: httpStatus,
+    failedAt: nowMs,
+  });
+  return true;
+}
+
+async function consumeSchoolBackoff(config, nowMs = Date.now(), deps = {}) {
+  if (!config.networkStatePath) return false;
+  const readJsonFn = deps.readJsonFn || readJson;
+  const writeJsonFn = deps.writeJsonFn || writeJson;
+  const rmFn = deps.rmFn || fsp.rm;
+  const state = await readJsonFn(config.networkStatePath, null);
+  if (!state || !Number.isFinite(state.schoolBackoffUntil)) return false;
+  if (nowMs < state.schoolBackoffUntil) return true;
+  delete state.schoolBackoffUntil;
+  delete state.schoolBackoffStatus;
+  if (Object.keys(state).some((key) => key !== 'failedAt')) {
+    await writeJsonFn(config.networkStatePath, state);
+  } else {
+    await rmFn(config.networkStatePath, { force: true });
   }
-  if (httpStatus >= 500 && httpStatus <= 599) {
-    await writeJson(config.networkStatePath, {
-      ...previous,
-      skipNextWatch: true,
-      schoolBackoffStatus: httpStatus,
-      failedAt: nowMs,
-    });
-  }
+  return false;
 }
 
 async function consumeWatchNetworkCooldown(config, nowMs = Date.now()) {
   if (!config.networkStatePath) return false;
   const state = await readJson(config.networkStatePath, null);
   if (!state) return false;
-  if (Number.isFinite(state.schoolBackoffUntil)) {
-    if (nowMs < state.schoolBackoffUntil) return true;
-    delete state.schoolBackoffUntil;
-    delete state.schoolBackoffStatus;
-  }
   if (state.skipNextWatch) {
     await fsp.rm(config.networkStatePath, { force: true });
     return true;
@@ -1429,21 +1591,14 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
 
 async function refreshAndSaveAuthState(config, deps = {}) {
   const readSavedAuthStateFn = deps.readSavedAuthStateFn || readSavedAuthState;
-  const readStorageStateFn = deps.readStorageStateFn || readStorageState;
   const saveAuthStateFn = deps.saveAuthStateFn || saveAuthState;
   const requestFn = deps.requestFn || requestRefreshedAuthState;
-  let current = await readSavedAuthStateFn(config.tokenPath);
+  const current = await readSavedAuthStateFn(config.tokenPath);
 
   if (!current.refreshToken) {
-    const storage = await readStorageStateFn(config.storageStatePath);
-    const migrated = extractAuthStateFromStorageState(storage, getBbguOrigin(config));
-    current = {
-      accessToken: current.accessToken || migrated.accessToken,
-      refreshToken: migrated.refreshToken,
-    };
-    if (current.accessToken && current.refreshToken) {
-      await saveAuthStateFn(config.tokenPath, current);
-    }
+    const error = new Error('No saved BBGU refresh token is available.');
+    error.code = 'BBGU_REFRESH_UNAVAILABLE';
+    throw error;
   }
 
   const refreshed = await requestFn(config, current, deps);
@@ -1573,7 +1728,22 @@ function parseBbguSubscoreResponse(response, options = {}) {
   try {
     body = JSON.parse(responseText);
   } catch {
-    throw new Error(`BBGU subscore API returned non-JSON HTTP ${response.status}: ${errorDetails(300)}`);
+    if (isAuthExpiredResponse({
+      httpStatus: response.status,
+      text: responseText,
+      body: null,
+      headers: response.headers,
+    })) {
+      const error = new Error('BBGU login state expired while fetching subscore.');
+      error.code = 'BBGU_AUTH_EXPIRED';
+      throw error;
+    }
+    const error = createScoreApiError(
+      `BBGU subscore API returned non-JSON HTTP ${response.status}: ${errorDetails(300)}`,
+      response
+    );
+    error.code = 'BBGU_SUBSCORE_PROTOCOL_ERROR';
+    throw error;
   }
 
   if (isAuthExpiredResponse({ httpStatus: response.status, text: responseText, body, headers: response.headers })) {
@@ -1583,7 +1753,10 @@ function parseBbguSubscoreResponse(response, options = {}) {
   }
 
   if (response.status < 200 || response.status >= 300 || body.status !== 'success') {
-    throw new Error(`BBGU subscore API failed HTTP ${response.status}: ${errorDetails(500)}`);
+    throw createScoreApiError(
+      `BBGU subscore API failed HTTP ${response.status}: ${errorDetails(500)}`,
+      response
+    );
   }
 
   return normalizeSubScoreList(body);
@@ -1687,11 +1860,14 @@ async function enrichRowsWithSubScores(diff, config, fetcher = fetchBbguSubScore
   for (const row of rowsMissingScoreId) {
     console.log(`[BBGU] Subscore skipped for ${row.courseName || row.key || 'unknown course'}: missing scoreId. fields=${formatSubScoreSourceKeys(row) || 'unknown'}`);
   }
-  if (!rowsToFetch.length) return { fetched: 0, failed: 0 };
+  if (!rowsToFetch.length) return { fetched: 0, failed: 0, skipped: 0, globalError: null };
 
   let fetched = 0;
   let failed = 0;
-  for (const row of rowsToFetch) {
+  let skipped = 0;
+  let globalError = null;
+  for (let index = 0; index < rowsToFetch.length; index += 1) {
+    const row = rowsToFetch[index];
     try {
       row.subScores = await fetcher(row.scoreId, config);
       row.subScoreFetchedAt = new Date().toISOString();
@@ -1704,10 +1880,34 @@ async function enrichRowsWithSubScores(diff, config, fetcher = fetchBbguSubScore
       row.subScoreFetchError = error && error.message ? error.message : String(error);
       failed += 1;
       console.log(`[BBGU] Subscore fetch failed for ${row.courseName || row.key}: ${row.subScoreFetchError}`);
+      if (isGlobalSubscoreFailure(error)) {
+        globalError = error;
+        for (const untouched of rowsToFetch.slice(index + 1)) {
+          untouched.subScoreFetchError = '本次因全局异常跳过';
+          delete untouched.subScoreFetchedAt;
+          skipped += 1;
+        }
+        break;
+      }
     }
   }
 
-  return { fetched, failed };
+  return { fetched, failed, skipped, globalError };
+}
+
+function isGlobalSubscoreFailure(error) {
+  const status = Number(error && error.httpStatus);
+  return Boolean(error && (
+    error.code === 'BBGU_AUTH_EXPIRED'
+    || error.code === 'BBGU_SUBSCORE_PROTOCOL_ERROR'
+    || ['BBGU_PROXY_NETWORK_FAILED', 'BBGU_PROXY_FAILOVER_EXHAUSTED'].includes(error.code)
+    || isNetworkTransportError(error)
+    || status === 401
+    || status === 403
+    || status === 404
+    || status === 429
+    || (status >= 500 && status <= 599)
+  ));
 }
 
 async function requestJsonText(url, headers, deps = {}) {
@@ -2014,12 +2214,14 @@ async function processGradeRows(currentRows, config, deps = {}) {
   const previousRows = migrateSnapshotGradeKeys(await readJson(config.snapshotPath, []));
   const rowsWithSavedSubScores = mergePersistedSubScores(previousRows, currentRows);
   const diff = diffGrades(previousRows, rowsWithSavedSubScores);
+  let subscoreGlobalError = null;
 
   if (diff.added.length || diff.changed.length) {
     const notificationId = buildGradeNotificationId(config.term, diff);
     const pending = await readPendingNotifications(config);
     if (!pending.items.some((item) => item.id === notificationId)) {
-      await enrichRowsWithSubScoresFn(diff, config);
+      const subscoreResult = await enrichRowsWithSubScoresFn(diff, config);
+      subscoreGlobalError = subscoreResult && subscoreResult.globalError;
       await enqueuePendingNotification(config, {
         id: notificationId,
         title: `BBGU 成绩更新：新增 ${diff.added.length}，变更 ${diff.changed.length}`,
@@ -2041,6 +2243,7 @@ async function processGradeRows(currentRows, config, deps = {}) {
   } else if (sent) {
     console.log(`[BBGU] Pending grade notifications sent. count=${sent}`);
   }
+  if (subscoreGlobalError) throw subscoreGlobalError;
   return { status: 'ok', count: rowsWithSavedSubScores.length, ...diff };
 }
 
@@ -2057,12 +2260,20 @@ async function isAuthenticated(page) {
   return false;
 }
 
+const BBGU_BROWSER_TOKEN_KEYS = new Set([
+  'cqu_edu_ACCESS_TOKEN',
+  'cqu_edu_CURRENT_TOKEN',
+  'cqu_edu_REFRESH_TOKEN',
+  'cqu_edu_TOKEN_EXPIRE',
+  'cqu_edu_EXPIRE_ACCESS_TOKEN',
+]);
+
 function sanitizeStorageStateForAccessRenewal(storageState, origin) {
   const cloned = JSON.parse(JSON.stringify(storageState || { cookies: [], origins: [] }));
-  const accessKeys = new Set(['cqu_edu_ACCESS_TOKEN', 'cqu_edu_CURRENT_TOKEN']);
   for (const entry of Array.isArray(cloned.origins) ? cloned.origins : []) {
     if (clean(entry.origin) !== clean(origin) || !Array.isArray(entry.localStorage)) continue;
-    entry.localStorage = entry.localStorage.filter((item) => !accessKeys.has(clean(item && item.name)));
+    entry.localStorage = entry.localStorage
+      .filter((item) => !BBGU_BROWSER_TOKEN_KEYS.has(clean(item && item.name)));
   }
   return cloned;
 }
@@ -2244,7 +2455,7 @@ async function shouldStartQrLogin(page, deps = {}) {
 
 async function waitForAuthState(page, timeoutMs, deps = {}) {
   const nowFn = deps.nowFn || Date.now;
-  const refreshGraceMs = deps.refreshGraceMs ?? 2000;
+  const refreshGraceMs = deps.refreshGraceMs ?? 10000;
   const deadline = nowFn() + timeoutMs;
   let latest = emptyAuthState();
   let accessSeenAt = null;
@@ -2272,7 +2483,9 @@ async function saveBrowserAuthState(page, config, deps = {}) {
   if (!authState.refreshToken) {
     const previous = await readSavedAuthStateFn(config.tokenPath);
     const reminderState = await readQrReminderStateFn(config);
-    if (previous.refreshToken && !(reminderState && reminderState.refreshExpired)) {
+    if (previous.refreshToken && !(reminderState && (
+      reminderState.refreshExpired || reminderState.accessRejectedAfterRefresh
+    ))) {
       authState = { ...authState, refreshToken: previous.refreshToken };
       console.log('[BBGU] Warning: login produced no new refresh token; preserving the previously saved refresh token.');
     } else {
@@ -2295,6 +2508,16 @@ async function finalizeLoginReminderState(config, authState, deps = {}) {
   }
 }
 
+async function persistBrowserLoginState(page, context, config, deps = {}) {
+  const saveBrowserAuthStateFn = deps.saveBrowserAuthStateFn || saveBrowserAuthState;
+  const finalizeLoginReminderStateFn = deps.finalizeLoginReminderStateFn || finalizeLoginReminderState;
+  const saveBrowserStorageStateFn = deps.saveBrowserStorageStateFn || saveBrowserStorageState;
+  const authState = await saveBrowserAuthStateFn(page, config);
+  await finalizeLoginReminderStateFn(config, authState);
+  await saveBrowserStorageStateFn(context, config.storageStatePath, config);
+  return authState;
+}
+
 async function collectLoginQrArtifacts(page, config, weixinQrCapture, deps = {}) {
   const saveQrElementScreenshotFn = deps.saveQrElementScreenshotFn || saveQrElementScreenshot;
   let weixinQrInfo = typeof weixinQrCapture.get === 'function' ? weixinQrCapture.get() : null;
@@ -2306,18 +2529,10 @@ async function collectLoginQrArtifacts(page, config, weixinQrCapture, deps = {})
   return { weixinQrInfo, qrElementScreenshotPath };
 }
 
-async function saveBrowserStorageState(context, filePath, deps = {}) {
-  const renameFn = deps.renameFn || fsp.rename;
-  const rmFn = deps.rmFn || fsp.rm;
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await context.storageState({ path: tempPath });
-    await renameFn(tempPath, filePath);
-  } catch (error) {
-    await rmFn(tempPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
+async function saveBrowserStorageState(context, filePath, config, deps = {}) {
+  const storageState = await context.storageState();
+  const sanitized = sanitizeStorageStateForAccessRenewal(storageState, getBbguOrigin(config));
+  await writeFileAtomic(filePath, `${JSON.stringify(sanitized, null, 2)}\n`, deps);
 }
 
 function selectChromiumExecutable({ osRelease, homeDir, exists, readdir }) {
@@ -2415,10 +2630,11 @@ async function withBrowserContext(config, createContextFn, callback) {
 
 async function performSilentRenew(context, config, deps = {}) {
   const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
-  const saveBrowserAuthStateFn = deps.saveBrowserAuthStateFn || saveBrowserAuthState;
+  const persistBrowserLoginStateFn = deps.persistBrowserLoginStateFn || persistBrowserLoginState;
+  const handleChromeErrorPageFn = deps.handleChromeErrorPageFn || handleChromeErrorPage;
   await context.route('**/*', async (route) => {
     const resourceType = route.request().resourceType();
-    if (resourceType === 'font' || resourceType === 'image' || resourceType === 'media') {
+    if (['font', 'image', 'media', 'stylesheet'].includes(resourceType)) {
       await route.abort();
       return;
     }
@@ -2443,12 +2659,18 @@ async function performSilentRenew(context, config, deps = {}) {
     console.log(`[BBGU] Silent CAS renew navigation was aborted by redirect; continuing token check. url=${page.url()}`);
   }
 
+  await handleChromeErrorPageFn(page, config);
+
   if (await isExplicitCasLoginPage(page)) {
     throw createCasExpiredError(`Silent CAS renew reached the login page. url=${page.url()}`);
   }
 
   try {
-    await saveBrowserAuthStateFn(page, config);
+    await persistBrowserLoginStateFn(page, context, config, {
+      saveBrowserAuthStateFn: deps.saveBrowserAuthStateFn || saveBrowserAuthState,
+      finalizeLoginReminderStateFn: deps.finalizeLoginReminderStateFn || finalizeLoginReminderState,
+      saveBrowserStorageStateFn: deps.saveBrowserStorageStateFn || saveBrowserStorageState,
+    });
   } catch (error) {
     const screenshotPath = await saveScreenshot(page, config, 'silent-renew-failed').catch(() => 'unavailable');
     if (await isExplicitCasLoginPage(page)) {
@@ -2457,7 +2679,6 @@ async function performSilentRenew(context, config, deps = {}) {
     throw new Error(`Silent CAS renew did not obtain complete browser auth state. url=${page.url()}; screenshot=${screenshotPath}; reason=${error.message || error}`);
   }
 
-  await saveBrowserStorageState(context, config.storageStatePath);
   console.log(`[BBGU] Silent CAS renew completed. Access token saved: ${config.tokenPath}`);
   console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
   return { status: 'renew_ok', tokenPath: config.tokenPath };
@@ -2482,50 +2703,148 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
     readSavedAuthStateFn = readSavedAuthState,
     saveQrReminderScheduleFn = saveQrReminderSchedule,
     markRefreshExpiredFn = markRefreshExpired,
+    markAccessRejectedAfterRefreshFn = markAccessRejectedAfterRefresh,
     clearQrReminderScheduleFn = clearQrReminderSchedule,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
     fetchScoreRowsFn = fetchBbguScoreRows,
+    serverAuthExpired: initialServerAuthExpired = false,
   } = deps;
 
+  let serverAuthExpired = initialServerAuthExpired;
   let renewalState = await readQrReminderStateFn(config);
-  const refreshKnownExpired = Boolean(
-    renewalState && (renewalState.refreshExpired || Number.isFinite(renewalState.dueAt))
-  );
+  let refreshKnownExpired = Boolean(renewalState && (
+    renewalState.refreshExpired
+    || renewalState.accessRejectedAfterRefresh
+    || Number.isFinite(renewalState.dueAt)
+  ));
+  const auth = await readSavedAuthStateFn(config.tokenPath);
+  const accessExpiry = extractJwtExpiry(auth.accessToken);
+  const refreshExpiry = extractJwtExpiry(auth.refreshToken);
+  if (serverAuthExpired && !refreshExpiry && !refreshKnownExpired) {
+    renewalState = {
+      ...(renewalState || {}),
+      ...((await markAccessRejectedAfterRefreshFn(config, auth.accessToken)) || {}),
+      accessRejectedAfterRefresh: true,
+    };
+    refreshKnownExpired = true;
+  }
+  if (!accessExpiry || (!refreshKnownExpired && !refreshExpiry)) {
+    const error = new Error('保存的BBGU Token缺少有效JWT exp。');
+    error.code = 'BBGU_LOCAL_AUTH_STATE_INVALID';
+    throw error;
+  }
+
+  if (!refreshKnownExpired && refreshExpiry.epochSeconds * 1000 <= nowFn()) {
+    renewalState = {
+      ...(renewalState || {}),
+      ...((await markRefreshExpiredFn(config)) || {}),
+      refreshExpired: true,
+    };
+    refreshKnownExpired = true;
+  }
+
   if (!refreshKnownExpired) {
+    const plan = serverAuthExpired
+      ? { action: 'REFRESH_ACCESS', reason: 'server-auth-expired' }
+      : planAutomaticAction({
+        mode: 'watch',
+        nowMs: nowFn(),
+        casExpired: true,
+        refreshExpired: false,
+        accessExpiryEpochSeconds: accessExpiry.epochSeconds,
+        refreshExpiryEpochSeconds: refreshExpiry.epochSeconds,
+        hasAccessToken: true,
+        hasRefreshToken: true,
+      });
+    if (plan.action !== 'REFRESH_ACCESS') {
+      const error = new Error(`Watch认证恢复决策器返回无法执行的动作：${plan.action}`);
+      error.code = 'BBGU_AUTOMATIC_ACTION_INVALID';
+      throw error;
+    }
+    let refreshed = false;
+    let refreshedAccessToken = '';
     try {
       console.log('[BBGU] Access token expired; trying refresh token first.');
-      await refreshAndSaveAuthStateFn(config);
+      const refreshResult = await refreshAndSaveAuthStateFn(config);
       await clearQrReminderScheduleFn(config);
-      console.log('[BBGU] Refresh token renewal completed; retrying score API.');
-      return fetchScoreRowsFn(config);
+      const refreshedAuth = refreshResult && refreshResult.authState
+        ? refreshResult.authState
+        : refreshResult;
+      if (refreshedAuth && refreshedAuth.accessToken) {
+        refreshedAccessToken = refreshedAuth.accessToken;
+        config.authorization = buildAuthorizationHeader(refreshedAuth.accessToken);
+      }
+      refreshed = true;
     } catch (error) {
       console.log(`[BBGU] Refresh Token续Access失败。原因：${error.message || error}`);
       if (!isTerminalRefreshAuthFailure(error)) {
         throw error;
       }
-      renewalState = await markRefreshExpiredFn(config);
+      renewalState = {
+        ...(renewalState || {}),
+        ...((await markRefreshExpiredFn(config)) || {}),
+        refreshExpired: true,
+      };
+      refreshKnownExpired = true;
+    }
+    if (refreshed) {
+      console.log('[BBGU] Refresh token renewal completed; retrying score API.');
+      try {
+        return await fetchScoreRowsFn(config);
+      } catch (error) {
+        if (!error || error.code !== 'BBGU_AUTH_EXPIRED') throw error;
+        renewalState = {
+          ...(renewalState || {}),
+          ...((await markAccessRejectedAfterRefreshFn(config, refreshedAccessToken)) || {}),
+          accessRejectedAfterRefresh: true,
+        };
+        refreshKnownExpired = true;
+        serverAuthExpired = true;
+      }
     }
   } else {
     console.log('[BBGU] Refresh Token已记录失效，本次跳过续期请求。');
   }
 
-  if (!renewalState || !Number.isFinite(renewalState.dueAt)) {
-    const auth = await readSavedAuthStateFn(config.tokenPath);
-    const expiry = extractJwtExpiry(auth.accessToken);
-    if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
-    renewalState = await saveQrReminderScheduleFn(
+  const needsImmediateQr = Boolean(
+    serverAuthExpired
+    && refreshKnownExpired
+    && renewalState
+    && renewalState.casExpired
+  );
+  if (serverAuthExpired && refreshKnownExpired && !needsImmediateQr) {
+    if (!renewalState || !renewalState.accessRejectedAfterRefresh) {
+      renewalState = {
+        ...(renewalState || {}),
+        ...((await markAccessRejectedAfterRefreshFn(config, auth.accessToken)) || {}),
+        accessRejectedAfterRefresh: true,
+      };
+    }
+    const error = new Error('新Access已被服务端拒绝，等待下一次Renew尝试CAS恢复。');
+    error.code = 'BBGU_AWAITING_CAS_RENEW';
+    throw error;
+  }
+  if (needsImmediateQr) {
+    const savedSchedule = await saveQrReminderScheduleFn(
       config,
-      computeQrSchedule(expiry.epochSeconds, nowFn())
+      computeImmediateQrSchedule(accessExpiry.epochSeconds, nowFn())
     );
+    renewalState = { ...(renewalState || {}), ...(savedSchedule || {}) };
+  } else if (!renewalState || !Number.isFinite(renewalState.dueAt)) {
+    const savedSchedule = await saveQrReminderScheduleFn(
+      config,
+      computeQrSchedule(accessExpiry.epochSeconds, nowFn())
+    );
+    renewalState = { ...(renewalState || {}), ...(savedSchedule || {}) };
   }
 
   const qrResult = await maybeRunScheduledQrFn(config, { nowFn, runLoginFn });
   if (!qrResult || qrResult.status !== 'login_ok') {
     throw new Error('二维码提醒仍在冷却期，本次成绩查询无法登录。');
   }
-  const auth = await readSavedAuthStateFn(config.tokenPath);
-  if (!auth.accessToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
-  config.authorization = buildAuthorizationHeader(auth.accessToken);
+  const loggedInAuth = await readSavedAuthStateFn(config.tokenPath);
+  if (!loggedInAuth.accessToken) throw new Error(`扫码登录完成，但没有在 ${config.tokenPath} 保存Access Token。`);
+  config.authorization = buildAuthorizationHeader(loggedInAuth.accessToken);
   return fetchScoreRowsFn(config);
 }
 
@@ -2582,6 +2901,8 @@ async function runCore(config = getConfig(), deps = {}) {
     recoverDirectApiAfterAuthExpiredFn = recoverDirectApiAfterAuthExpired,
     runLoginFn = runLogin,
     readSavedAuthStateAfterLoginFn = readSavedAuthStateFn,
+    readQrReminderStateFn = readQrReminderState,
+    clearQrReminderStateFn = clearQrReminderState,
     processGradeRowsFn = processGradeRows,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
     nowFn = Date.now,
@@ -2611,6 +2932,8 @@ async function runCore(config = getConfig(), deps = {}) {
       gradeError = error;
     }
 
+    if (gradeError && isGlobalSubscoreFailure(gradeError)) throw gradeError;
+
     try {
       await maybeRunScheduledQrFn(config);
     } catch (qrError) {
@@ -2625,6 +2948,32 @@ async function runCore(config = getConfig(), deps = {}) {
   if (config.authorization) {
     console.log('[BBGU] Using direct score API mode with current access token.');
     let currentRows;
+    let authRecoveryState = await readQrReminderStateFn(config);
+    if (authRecoveryState && authRecoveryState.accessRejectedAfterRefresh) {
+      const rejectedFingerprint = authRecoveryState.rejectedAccessFingerprint;
+      const currentFingerprint = fingerprintToken(config.authorization);
+      const markerMatchesCurrentAccess = !rejectedFingerprint
+        || rejectedFingerprint === currentFingerprint;
+      if (!markerMatchesCurrentAccess) {
+        try {
+          await clearQrReminderStateFn(config);
+        } catch (error) {
+          console.error(`[BBGU] 清理旧Access拒绝标记失败，本次仍使用新Access查询：${error.message || error}`);
+        }
+        authRecoveryState = null;
+      } else {
+        if (!authRecoveryState.casExpired) {
+          console.log('[BBGU] 新Access已被服务端拒绝，本次Watch等待Renew尝试CAS恢复。');
+          return { status: 'awaiting_cas_renew' };
+        }
+        currentRows = await recoverDirectApiAfterAuthExpiredFn(config, {
+          fetchScoreRowsFn,
+          nowFn,
+          serverAuthExpired: true,
+        });
+        return finishGradeRun(currentRows);
+      }
+    }
     const localExpiry = extractJwtExpiry(config.authorization);
     if (localExpiry && localExpiry.epochSeconds * 1000 <= nowFn()) {
       console.log('[BBGU] Access token is locally known to be expired; skipping the avoidable score API request.');
@@ -2634,13 +2983,30 @@ async function runCore(config = getConfig(), deps = {}) {
         currentRows = await fetchScoreRowsFn(config);
       } catch (error) {
         if (error && error.code === 'BBGU_AUTH_EXPIRED') {
-          currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn, nowFn });
+          currentRows = await recoverDirectApiAfterAuthExpiredFn(config, {
+            fetchScoreRowsFn,
+            nowFn,
+            serverAuthExpired: true,
+          });
         } else {
           throw error;
         }
       }
     }
     return finishGradeRun(currentRows);
+  }
+
+  const qrState = await readQrReminderStateFn(config);
+  const loginPlan = planAutomaticAction({
+    mode: 'watch',
+    nowMs: nowFn(),
+    hasAccessToken: false,
+    hasRefreshToken: false,
+    qrLastPushedAt: Number(qrState && qrState.lastPushedAt) || 0,
+  });
+  if (loginPlan.action === 'WAIT_QR_DUE') {
+    console.log('[BBGU] 二维码仍在冷却期，本次Watch不重复生成。');
+    return { status: 'qr_cooldown_skipped' };
   }
 
   console.log('[BBGU] No saved direct API token found; starting automatic QR login renewal.');
@@ -2655,19 +3021,25 @@ async function runCore(config = getConfig(), deps = {}) {
 }
 
 async function run(config = getConfig(), deps = {}) {
+  const consumeSchoolBackoffFn = deps.consumeSchoolBackoffFn || consumeSchoolBackoff;
   const consumeWatchNetworkCooldownFn = deps.consumeWatchNetworkCooldownFn || consumeWatchNetworkCooldown;
   const markWatchNetworkFailureFn = deps.markWatchNetworkFailureFn || markWatchNetworkFailure;
   const markSchoolBackoffFn = deps.markSchoolBackoffFn || markSchoolBackoff;
+  const runCoreFn = deps.runCoreFn || runCore;
+  if (await consumeSchoolBackoffFn(config)) {
+    console.log('[BBGU] 当前处于学校服务退避期，本次Watch不访问学校。');
+    return { status: 'school_backoff_skipped' };
+  }
   if (await consumeWatchNetworkCooldownFn(config)) {
     console.log('[BBGU] 当前处于网络或学校服务退避期，本次Watch不访问学校。');
     return { status: 'network_cooldown_skipped' };
   }
   try {
-    return await runCore(config, deps);
+    return await runCoreFn(config, deps);
   } catch (error) {
     if (error && ['BBGU_PROXY_FAILOVER_EXHAUSTED', 'BBGU_PROXY_NETWORK_FAILED'].includes(error.code)) {
       await markWatchNetworkFailureFn(config);
-    } else if (error && (error.httpStatus === 429 || (error.httpStatus >= 500 && error.httpStatus <= 599))) {
+    } else if (error && [429, 500, 503].includes(Number(error.httpStatus))) {
       await markSchoolBackoffFn(config, error);
     }
     throw error;
@@ -2679,17 +3051,26 @@ async function runLogin(config = getConfig(), options = {}) {
     throw new Error('Missing PUSHPLUS_TOKEN. Set it in GitHub repository secrets.');
   }
 
+  const nowFn = options.nowFn || Date.now;
+  const consumeSchoolBackoffFn = options.consumeSchoolBackoffFn || consumeSchoolBackoff;
+  const markQrPushedFn = options.markQrPushedFn || markQrPushed;
+  const withBrowserContextFn = options.withBrowserContextFn || withBrowserContext;
+  if (await consumeSchoolBackoffFn(config, nowFn())) {
+    console.log('[BBGU] 当前处于学校服务退避期，本次二维码登录不访问学校。');
+    return { status: 'school_backoff_skipped' };
+  }
+
   const ignoreInitialAccessToken = Boolean(options.ignoreInitialAccessToken);
   const loginContextFactory = ignoreInitialAccessToken
     ? (browser, nextConfig) => createAccessRenewalContext(browser, nextConfig)
     : createContext;
-  return withBrowserContext(config, loginContextFactory, async (context) => {
+  return withBrowserContextFn(config, loginContextFactory, async (context) => {
     const page = await context.newPage();
     installPageRequestFailureCapture(page);
     const weixinQrCapture = createWeixinQrCapture(page);
     const onQrSent = typeof options.onQrSent === 'function'
       ? options.onQrSent
-      : async () => undefined;
+      : async () => markQrPushedFn(config, nowFn());
     if (ignoreInitialAccessToken) console.log('[BBGU] Cleared saved browser access token locally before login fallback.');
     console.log(`[BBGU] Opening ${config.homeUrl} for login.`);
     try {
@@ -2700,12 +3081,11 @@ async function runLogin(config = getConfig(), options = {}) {
         },
       });
     } catch (error) {
-      if (error && (error.httpStatus === 429 || (error.httpStatus >= 500 && error.httpStatus <= 599))) {
+      if (error && [429, 500, 503].includes(Number(error.httpStatus))) {
         await markSchoolBackoff(config, error);
       }
       throw error;
     }
-    await page.waitForTimeout(3000);
     await handleChromeErrorPage(page, config);
 
     if (await shouldStartQrLogin(page)) {
@@ -2765,9 +3145,7 @@ async function runLogin(config = getConfig(), options = {}) {
     }
 
     weixinQrCapture.stop();
-    const authState = await saveBrowserAuthState(page, config);
-    await saveBrowserStorageState(context, config.storageStatePath);
-    await finalizeLoginReminderState(config, authState);
+    await persistBrowserLoginState(page, context, config);
     console.log(`[BBGU] Access token saved: ${config.tokenPath}`);
     console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
     return { status: 'login_ok', tokenPath: config.tokenPath };
@@ -2779,8 +3157,6 @@ async function maybeRunScheduledQr(config, deps = {}) {
     nowFn = Date.now,
     readQrReminderStateFn = readQrReminderState,
     saveQrReminderScheduleFn = saveQrReminderSchedule,
-    clearQrReminderScheduleFn = clearQrReminderSchedule,
-    clearQrReminderStateFn = clearQrReminderState,
     runLoginFn = runLogin,
   } = deps;
   const state = await readQrReminderStateFn(config);
@@ -2799,7 +3175,6 @@ async function maybeRunScheduledQr(config, deps = {}) {
       await saveQrReminderScheduleFn(config, { ...state, lastPushedAt: nowFn() });
     },
   });
-  await clearQrReminderStateFn(config);
   return result;
 }
 
@@ -2844,6 +3219,8 @@ async function runRenew(config = getConfig(), deps = {}) {
   const {
     nowFn = Date.now,
     logFn = console.log,
+    consumeSchoolBackoffFn = consumeSchoolBackoff,
+    markSchoolBackoffFn = markSchoolBackoff,
     readQrReminderStateFn = readQrReminderState,
     runSilentRenewFn = runSilentRenew,
     markCasExpiredFn = markCasExpired,
@@ -2853,10 +3230,29 @@ async function runRenew(config = getConfig(), deps = {}) {
     saveQrReminderScheduleFn = saveQrReminderSchedule,
     clearQrReminderScheduleFn = clearQrReminderSchedule,
     clearQrReminderStateFn = clearQrReminderState,
+    finalizeLoginReminderStateFn = finalizeLoginReminderState,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
   } = deps;
 
-  const renewalState = await readQrReminderStateFn(config);
+  if (await consumeSchoolBackoffFn(config, nowFn())) {
+    logFn('[BBGU] 当前处于学校服务退避期，本次Renew不访问学校。');
+    return { status: 'school_backoff_skipped' };
+  }
+
+  let renewalState = await readQrReminderStateFn(config);
+  if (renewalState && renewalState.accessRejectedAfterRefresh
+    && renewalState.rejectedAccessFingerprint) {
+    const currentAuth = await readSavedAuthStateFn(config.tokenPath);
+    const currentFingerprint = fingerprintToken(currentAuth.accessToken);
+    if (currentFingerprint && currentFingerprint !== renewalState.rejectedAccessFingerprint) {
+      try {
+        await clearQrReminderStateFn(config);
+      } catch (error) {
+        logFn(`[BBGU] 清理旧Access拒绝标记失败，本次仍按新Token续期：${error.message || error}`);
+      }
+      renewalState = null;
+    }
+  }
   let casStatus = renewalState && renewalState.casExpired ? 'expired_skipped' : 'unchecked';
   if (!renewalState || !renewalState.casExpired) {
     let result;
@@ -2864,17 +3260,25 @@ async function runRenew(config = getConfig(), deps = {}) {
       result = await runSilentRenewFn(config);
     } catch (casError) {
       if (!casError || casError.code !== 'BBGU_CAS_EXPIRED') {
+        if (casError && [429, 500, 503].includes(Number(casError.httpStatus))) {
+          await markSchoolBackoffFn(config, casError, nowFn());
+        }
         console.log(`[BBGU] CAS静默续期发生本地或网络故障，本次不判定Session失效。原因：${casError && (casError.message || casError)}`);
         throw casError;
       }
-      await markCasExpiredFn(config);
+      renewalState = await markCasExpiredFn(config)
+        || { ...(renewalState || {}), casExpired: true };
       casStatus = 'expired';
       console.log(`[BBGU] CAS静默续期失败，后续改用Refresh Token续Access。原因：${casError.message || casError}`);
     }
 
     if (casStatus !== 'expired') {
-      await clearQrReminderStateFn(config);
       const authState = await readSavedAuthStateFn(config.tokenPath);
+      if (authState.refreshToken) {
+        await clearQrReminderStateFn(config);
+      } else {
+        await finalizeLoginReminderStateFn(config, authState);
+      }
       logFn(formatAuthStatusSummary({
         casStatus: 'valid',
         refreshStatus: 'unchecked',
@@ -2885,52 +3289,125 @@ async function runRenew(config = getConfig(), deps = {}) {
     }
   }
 
-  let currentRenewalState = renewalState;
-  const refreshKnownExpired = Boolean(
-    renewalState && (renewalState.refreshExpired || Number.isFinite(renewalState.dueAt))
-  );
-  if (!refreshKnownExpired) {
-    try {
-      const refreshResult = await refreshAndSaveAuthStateFn(config);
-      await clearQrReminderScheduleFn(config);
-      const authState = refreshResult && refreshResult.authState
-        ? refreshResult.authState
-        : refreshResult && (refreshResult.accessToken || refreshResult.refreshToken)
-          ? refreshResult
-          : await readSavedAuthStateFn(config.tokenPath);
+  const auth = await readSavedAuthStateFn(config.tokenPath);
+  const accessExpiry = extractJwtExpiry(auth.accessToken);
+  const refreshExpiry = extractJwtExpiry(auth.refreshToken);
+  const refreshUnavailableKnown = Boolean(renewalState && (
+    renewalState.refreshExpired || renewalState.accessRejectedAfterRefresh
+  ));
+  if (!accessExpiry || (!refreshUnavailableKnown && !refreshExpiry)) {
+    const error = new Error('保存的BBGU Token缺少有效JWT exp。');
+    error.code = 'BBGU_LOCAL_AUTH_STATE_INVALID';
+    throw error;
+  }
+
+  if (renewalState && renewalState.accessRejectedAfterRefresh) {
+    const savedSchedule = await saveQrReminderScheduleFn(
+      config,
+      computeImmediateQrSchedule(accessExpiry.epochSeconds, nowFn())
+    );
+    renewalState = { ...renewalState, ...(savedSchedule || {}) };
+    logFn(formatAuthStatusSummary({
+      casStatus,
+      refreshStatus: 'valid',
+      authState: auth,
+      nowMs: nowFn(),
+    }));
+    return maybeRunScheduledQrFn(config, { nowFn });
+  }
+
+  for (;;) {
+    const plan = planAutomaticAction({
+      mode: 'renew',
+      nowMs: nowFn(),
+      casExpired: true,
+      refreshExpired: Boolean(renewalState && renewalState.refreshExpired),
+      accessExpiryEpochSeconds: accessExpiry.epochSeconds,
+      refreshExpiryEpochSeconds: refreshExpiry ? refreshExpiry.epochSeconds : 0,
+      qrDueAt: Number(renewalState && renewalState.dueAt) || 0,
+      qrLastPushedAt: Number(renewalState && renewalState.lastPushedAt) || 0,
+      hasAccessToken: Boolean(auth.accessToken),
+      hasRefreshToken: Boolean(auth.refreshToken),
+    });
+
+    if (plan.action === 'WAIT_REFRESH_WINDOW') {
       logFn(formatAuthStatusSummary({
         casStatus,
         refreshStatus: 'valid',
-        authState,
+        authState: auth,
         nowMs: nowFn(),
       }));
-      return { status: 'refresh_ok' };
-    } catch (refreshError) {
-      if (!isTerminalRefreshAuthFailure(refreshError)) {
-        console.log(`[BBGU] Refresh Token续Access临时失败，本次不安排二维码。原因：${refreshError.message || refreshError}`);
-        throw refreshError;
-      }
-      console.log(`[BBGU] Refresh Token失效，根据最后一枚Access的过期时间安排二维码。原因：${refreshError.message || refreshError}`);
-      currentRenewalState = await markRefreshExpiredFn(config);
+      return { status: 'refresh_waiting', reason: plan.reason };
     }
-  } else {
-    console.log('[BBGU] Refresh Token已记录失效，本次跳过续期请求。');
-  }
 
-  const auth = await readSavedAuthStateFn(config.tokenPath);
-  logFn(formatAuthStatusSummary({
-    casStatus,
-    refreshStatus: refreshKnownExpired ? 'expired_skipped' : 'expired',
-    authState: auth,
-    nowMs: nowFn(),
-  }));
-  if (!currentRenewalState || !Number.isFinite(currentRenewalState.dueAt)) {
-    const expiry = extractJwtExpiry(auth.accessToken);
-    if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
-    const schedule = computeQrSchedule(expiry.epochSeconds, nowFn());
-    currentRenewalState = await saveQrReminderScheduleFn(config, schedule);
+    if (plan.action === 'REFRESH_ACCESS') {
+      try {
+        const refreshResult = await refreshAndSaveAuthStateFn(config);
+        await clearQrReminderScheduleFn(config);
+        const authState = refreshResult && refreshResult.authState
+          ? refreshResult.authState
+          : refreshResult && (refreshResult.accessToken || refreshResult.refreshToken)
+            ? refreshResult
+            : await readSavedAuthStateFn(config.tokenPath);
+        logFn(formatAuthStatusSummary({
+          casStatus,
+          refreshStatus: 'valid',
+          authState,
+          nowMs: nowFn(),
+        }));
+        return { status: 'refresh_ok' };
+      } catch (refreshError) {
+        if (!isTerminalRefreshAuthFailure(refreshError)) {
+          if ([429, 500, 503].includes(Number(refreshError && refreshError.httpStatus))) {
+            await markSchoolBackoffFn(config, refreshError, nowFn());
+          }
+          console.log(`[BBGU] Refresh Token续Access临时失败，本次不安排二维码。原因：${refreshError.message || refreshError}`);
+          throw refreshError;
+        }
+        console.log(`[BBGU] Refresh Token失效，根据最后一枚Access的过期时间安排二维码。原因：${refreshError.message || refreshError}`);
+        renewalState = {
+          ...(renewalState || {}),
+          ...((await markRefreshExpiredFn(config)) || {}),
+          casExpired: true,
+          refreshExpired: true,
+        };
+        continue;
+      }
+    }
+
+    if (plan.action === 'MARK_REFRESH_EXPIRED') {
+      renewalState = {
+        ...(renewalState || {}),
+        ...((await markRefreshExpiredFn(config)) || {}),
+        casExpired: true,
+        refreshExpired: true,
+      };
+      continue;
+    }
+
+    if (plan.action === 'SCHEDULE_QR') {
+      const savedSchedule = await saveQrReminderScheduleFn(
+        config,
+        computeQrSchedule(accessExpiry.epochSeconds, nowFn())
+      );
+      renewalState = { ...(renewalState || {}), ...(savedSchedule || {}) };
+      continue;
+    }
+
+    if (plan.action === 'QR_LOGIN' || plan.action === 'WAIT_QR_DUE') {
+      logFn(formatAuthStatusSummary({
+        casStatus,
+        refreshStatus: 'expired_skipped',
+        authState: auth,
+        nowMs: nowFn(),
+      }));
+      return maybeRunScheduledQrFn(config, { nowFn });
+    }
+
+    const error = new Error(`Renew决策器返回无法执行的动作：${plan.action}`);
+    error.code = 'BBGU_AUTOMATIC_ACTION_INVALID';
+    throw error;
   }
-  return maybeRunScheduledQrFn(config, { nowFn });
 }
 
 if (require.main === module) {
@@ -2957,8 +3434,13 @@ module.exports = {
   decodeJwtPayload,
   extractJwtExpiry,
   formatAuthStatusSummary,
+  scheduledAutomaticRunsFrom,
+  firstUncoveredGradeQuery,
+  planRefreshAction,
+  planAutomaticAction,
   computeQrSchedule,
   shouldPushQrNow,
+  markQrPushed,
   normalizeGradeRows,
   migrateSnapshotGradeKeys,
   diffGrades,
@@ -3000,6 +3482,7 @@ module.exports = {
   withSingleProxyFailover,
   markWatchNetworkFailure,
   markSchoolBackoff,
+  consumeSchoolBackoff,
   consumeWatchNetworkCooldown,
   readSavedAuthState,
   saveAuthState,
@@ -3019,6 +3502,7 @@ module.exports = {
   shouldStartQrLogin,
   saveBrowserAuthState,
   finalizeLoginReminderState,
+  persistBrowserLoginState,
   clearBrowserAccessTokens,
   validateBrowserHttpResponse,
   handleChromeErrorPage,

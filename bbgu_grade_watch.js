@@ -1014,10 +1014,10 @@ async function sendPushPlus({
   try {
     body = JSON.parse(text);
   } catch {
-    body = { raw: text };
+    throw new Error(`PushPlus send failed: HTTP ${response.status} invalid JSON response`);
   }
 
-  if (!response.ok || (body.code !== undefined && body.code !== 200)) {
+  if (!response.ok || !body || typeof body !== 'object' || Number(body.code) !== 200) {
     throw new Error(`PushPlus send failed: HTTP ${response.status} ${text}`);
   }
 
@@ -1323,17 +1323,20 @@ async function refreshAndSaveAuthState(config, deps = {}) {
 
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let refreshed;
     try {
-      const refreshed = await requestFn(config, current, deps);
-      await saveAuthStateFn(config.tokenPath, refreshed);
-      config.authorization = buildAuthorizationHeader(refreshed.accessToken);
-      return { status: 'refresh_ok', authState: refreshed };
+      refreshed = await requestFn(config, current, deps);
     } catch (error) {
       lastError = error;
       const retryable = !error.httpStatus || error.httpStatus >= 500;
       if (!retryable || attempt === 2 || error.code === 'BBGU_REFRESH_UNAVAILABLE') break;
       console.log(`[BBGU] Refresh request failed; retrying once. reason=${error.message || error}`);
+      continue;
     }
+
+    await saveAuthStateFn(config.tokenPath, refreshed);
+    config.authorization = buildAuthorizationHeader(refreshed.accessToken);
+    return { status: 'refresh_ok', authState: refreshed };
   }
   throw lastError;
 }
@@ -2247,8 +2250,16 @@ async function runRenew(config = getConfig(), deps = {}) {
   const renewalState = await readQrReminderStateFn(config);
   let casStatus = renewalState && renewalState.casExpired ? 'expired_skipped' : 'unchecked';
   if (!renewalState || !renewalState.casExpired) {
+    let result;
     try {
-      const result = await runSilentRenewFn(config);
+      result = await runSilentRenewFn(config);
+    } catch (casError) {
+      await markCasExpiredFn(config);
+      casStatus = 'expired';
+      console.log(`[BBGU] CAS静默续期失败，后续改用Refresh Token续Access。原因：${casError.message || casError}`);
+    }
+
+    if (casStatus !== 'expired') {
       await clearQrReminderStateFn(config);
       const authState = await readSavedAuthStateFn(config.tokenPath);
       logFn(formatAuthStatusSummary({
@@ -2258,10 +2269,6 @@ async function runRenew(config = getConfig(), deps = {}) {
         nowMs: nowFn(),
       }));
       return result;
-    } catch (casError) {
-      await markCasExpiredFn(config);
-      casStatus = 'expired';
-      console.log(`[BBGU] CAS静默续期失败，后续改用Refresh Token续Access。原因：${casError.message || casError}`);
     }
   }
 

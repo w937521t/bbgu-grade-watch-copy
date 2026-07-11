@@ -83,6 +83,9 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /docker pull "\$mihomo_image"/);
   assert.doesNotMatch(yaml, /metacubex\/mihomo:Alpha/);
   assert.match(yaml, /proxy-providers:/);
+  const providerBlock = yaml.match(/proxy-providers:[\s\S]*?(?=\n          proxy-groups:)/)?.[0] || '';
+  assert.doesNotMatch(providerBlock, /health-check:/);
+  assert.doesNotMatch(providerBlock, /zhjw\.bbgu\.edu\.cn/);
   assert.match(yaml, /external-controller: 127\.0\.0\.1:9090/);
   assert.match(yaml, /name: BBGU-STICKY/);
   assert.match(yaml, /type: select/);
@@ -128,11 +131,25 @@ test('Workflow在启动Mihomo前恢复状态以沿用上次粘性节点', () => 
   assert.ok(restoreIndex < mihomoIndex);
 });
 
-test('Workflow用浏览器式GET验证代理并在主任务失败时输出Mihomo日志', () => {
+test('Workflow通过四个必要端点验证代理并在主任务失败时输出Mihomo日志', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
+  const setProxyFunction = yaml.match(/set_group_proxy\(\) \{[\s\S]*?\n          \}/)?.[0] || '';
+  const probeFunction = yaml.match(/test_bbgu_proxy\(\) \{[\s\S]*?\n          \}/)?.[0] || '';
+  const selectionBlock = yaml.match(/if \[\[ -n "\$saved_proxy" \]\]; then[\s\S]*?done <<< "\$candidates"/)?.[0] || '';
 
-  assert.doesNotMatch(yaml, /curl -f -I -L --proxy/);
-  assert.match(yaml, /curl -f -L --proxy[\s\S]*?-A ['"]Mozilla\/5\.0/);
+  assert.match(setProxyFunction, /for attempt in \{1\.\.3\}/);
+  assert.match(setProxyFunction, /return 1/);
+  assert.match(probeFunction, /https:\/\/zhjw\.bbgu\.edu\.cn\/workspace\/home/);
+  assert.match(probeFunction, /https:\/\/zhjw\.bbgu\.edu\.cn\/api\/sam\/score\/student\/score/);
+  assert.match(probeFunction, /https:\/\/authserver\.bbgu\.edu\.cn\//);
+  assert.match(probeFunction, /https:\/\/open\.weixin\.qq\.com\//);
+  assert.match(probeFunction, /-A ['"]Mozilla\/5\.0/);
+  assert.doesNotMatch(probeFunction, /curl[^\n]*\s-f(?:\s|$)/);
+  assert.match(probeFunction, /return 1/);
+  assert.doesNotMatch(selectionBlock, /set_group_proxy "\$(?:saved_proxy|candidate)" &&/);
+  assert.match(selectionBlock, /if ! set_group_proxy "\$saved_proxy"; then[\s\S]*?exit 1[\s\S]*?if result="\$\(test_bbgu_proxy\)"; then/);
+  assert.match(selectionBlock, /if ! set_group_proxy "\$candidate"; then[\s\S]*?exit 1[\s\S]*?if result="\$\(test_bbgu_proxy\)"; then/);
+  assert.doesNotMatch(selectionBlock, /test_bbgu_proxy 2>\/dev\/null/);
   assert.match(yaml, /name: Mihomo诊断日志/);
   assert.match(yaml, /if: steps\.run_bbgu\.outcome == 'failure'/);
   assert.match(yaml, /docker logs --tail 100 bbgu-mihomo/);

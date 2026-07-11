@@ -116,12 +116,6 @@ jobs:
               interval: 3600
               filter: "$proxy_filter"
               exclude-filter: "$proxy_exclude"
-              health-check:
-                enable: true
-                url: https://zhjw.bbgu.edu.cn/workspace/home
-                interval: 300
-                timeout: 10000
-                lazy: false
           proxy-groups:
             - name: BBGU-STICKY
               type: select
@@ -166,18 +160,44 @@ jobs:
           set_group_proxy() {
             local name="$1"
             local body
+            local attempt
             body="$(node -e 'process.stdout.write(JSON.stringify({name: process.argv[1]}))' "$name")"
-            curl -fsS -X PUT "$mihomo_controller/proxies/$proxy_group" \
-              -H 'Content-Type: application/json' \
-              --data "$body" >/dev/null
+            for attempt in {1..3}; do
+              if curl -fsS --connect-timeout 2 --max-time 5 \
+                -X PUT "$mihomo_controller/proxies/$proxy_group" \
+                -H 'Content-Type: application/json' \
+                --data "$body" >/dev/null; then
+                return 0
+              fi
+              if [[ "$attempt" != "3" ]]; then
+                echo "[BBGU] Mihomo控制器选择节点失败，准备重试（$attempt/3）：$name" >&2
+                sleep 1
+              fi
+            done
+            echo "[BBGU] Mihomo控制器无法选择节点：$name" >&2
+            return 1
           }
 
           test_bbgu_proxy() {
-            curl -f -L --proxy http://127.0.0.1:7890 \
-              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
-              --connect-timeout 5 --max-time 10 -o /dev/null -sS \
-              -w 'HTTP=%{http_code} CONNECT=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s' \
-              https://zhjw.bbgu.edu.cn/workspace/home
+            local endpoint
+            local http_code
+            local endpoints=(
+              'https://zhjw.bbgu.edu.cn/workspace/home'
+              'https://zhjw.bbgu.edu.cn/api/sam/score/student/score'
+              'https://authserver.bbgu.edu.cn/'
+              'https://open.weixin.qq.com/'
+            )
+
+            for endpoint in "${endpoints[@]}"; do
+              if ! http_code="$(curl --proxy http://127.0.0.1:7890 \
+                -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
+                --connect-timeout 5 --max-time 10 -o /dev/null -sS \
+                -w '%{http_code}' "$endpoint")"; then
+                echo "[BBGU] 必要端点网络不可用：$endpoint" >&2
+                return 1
+              fi
+              echo "[BBGU] 必要端点可达：$endpoint HTTP=$http_code"
+            done
           }
 
           save_sticky_proxy() {
@@ -195,7 +215,10 @@ jobs:
           if [[ -n "$saved_proxy" ]]; then
             echo "[BBGU] 沿用上次可用节点：$saved_proxy"
             if grep -Fxq "$saved_proxy" <<< "$candidates"; then
-              if set_group_proxy "$saved_proxy" && result="$(test_bbgu_proxy 2>/dev/null)"; then
+              if ! set_group_proxy "$saved_proxy"; then
+                exit 1
+              fi
+              if result="$(test_bbgu_proxy)"; then
                 echo "[BBGU] Mihomo粘性节点可用：$saved_proxy $result"
                 exit 0
               fi
@@ -209,7 +232,10 @@ jobs:
             [[ -z "$candidate" ]] && continue
             [[ "$candidate" == "$saved_proxy" ]] && continue
             echo "[BBGU] 测试候选节点：$candidate"
-            if set_group_proxy "$candidate" && result="$(test_bbgu_proxy 2>/dev/null)"; then
+            if ! set_group_proxy "$candidate"; then
+              exit 1
+            fi
+            if result="$(test_bbgu_proxy)"; then
               save_sticky_proxy "$candidate"
               echo "[BBGU] Mihomo代理可用：$candidate $result"
               exit 0

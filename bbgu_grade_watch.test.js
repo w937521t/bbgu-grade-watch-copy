@@ -436,6 +436,34 @@ test('sendPushPlus sends markdown template messages', async () => {
   }
 });
 
+test('sendPushPlus只接受明确的JSON业务成功响应', async (t) => {
+  const invoke = (body, status = 200) => sendPushPlus({
+    token: 'push-token',
+    title: 'title',
+    content: 'content',
+    fetchFn: async () => new Response(body, { status }),
+  });
+
+  await t.test('接受数字200', async () => {
+    await assert.doesNotReject(invoke('{"code":200,"msg":"success"}'));
+  });
+  await t.test('接受字符串200', async () => {
+    await assert.doesNotReject(invoke('{"code":"200","msg":"success"}'));
+  });
+  await t.test('拒绝HTML 200', async () => {
+    await assert.rejects(invoke('<html>upstream error</html>'), /PushPlus send failed/);
+  });
+  await t.test('拒绝缺少code', async () => {
+    await assert.rejects(invoke('{"msg":"success"}'), /PushPlus send failed/);
+  });
+  await t.test('拒绝业务失败码', async () => {
+    await assert.rejects(invoke('{"code":500,"msg":"failed"}'), /PushPlus send failed/);
+  });
+  await t.test('拒绝HTTP失败', async () => {
+    await assert.rejects(invoke('{"code":200,"msg":"success"}', 503), /PushPlus send failed/);
+  });
+});
+
 test('fetchWithTimeout会中止并拒绝超时请求', async () => {
   await assert.rejects(
     fetchWithTimeout(
@@ -1376,6 +1404,21 @@ test('CAS续期成功后renew结束并清除待扫码状态', async () => {
   assert.match(logs.join('\n'), /Access Token：有效/);
 });
 
+test('CAS成功后的本地清理失败不标记CAS失效且不调用Refresh', async () => {
+  const calls = [];
+  const cleanupError = new Error('local cleanup failed');
+
+  await assert.rejects(runRenew({ tokenPath: 'token.env' }, {
+    readQrReminderStateFn: async () => null,
+    runSilentRenewFn: async () => { calls.push('cas'); return { status: 'renew_ok' }; },
+    clearQrReminderStateFn: async () => { calls.push('clear'); throw cleanupError; },
+    markCasExpiredFn: async () => calls.push('mark-cas-expired'),
+    refreshAndSaveAuthStateFn: async () => calls.push('refresh'),
+  }), (error) => error === cleanupError);
+
+  assert.deepEqual(calls, ['cas', 'clear']);
+});
+
 test('CAS首次失败后记录失效并使用Refresh续Access', async () => {
   const calls = [];
   const result = await runRenew({}, {
@@ -1832,6 +1875,31 @@ test('refreshAndSaveAuthState retries a transient failure and saves rotated toke
     filePath: 'token.env',
     state: { accessToken: 'new.access', refreshToken: 'new.refresh' },
   }]);
+});
+
+test('refreshAndSaveAuthState保存失败时不再次请求Refresh', async () => {
+  let requestCalls = 0;
+  let saveCalls = 0;
+  const saveError = new Error('disk write failed');
+
+  await assert.rejects(refreshAndSaveAuthState({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    tokenPath: 'token.env',
+    storageStatePath: 'storage.json',
+  }, {
+    readSavedAuthStateFn: async () => ({ accessToken: 'old.access', refreshToken: 'old.refresh' }),
+    requestFn: async () => {
+      requestCalls += 1;
+      return { accessToken: 'new.access', refreshToken: 'new.refresh' };
+    },
+    saveAuthStateFn: async () => {
+      saveCalls += 1;
+      throw saveError;
+    },
+  }), (error) => error === saveError);
+
+  assert.equal(requestCalls, 1);
+  assert.equal(saveCalls, 1);
 });
 
 test('refreshAndSaveAuthState retries HTTP 5xx once', async () => {

@@ -5,8 +5,10 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const https = require('node:https');
 const net = require('node:net');
+const os = require('node:os');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { spawn } = require('node:child_process');
 const tls = require('node:tls');
 const util = require('node:util');
 
@@ -73,6 +75,119 @@ function unquoteToken(value) {
 function buildAuthorizationHeader(accessToken) {
   const token = unquoteToken(accessToken);
   return token ? `Bearer ${token}` : '';
+}
+
+function quoteCurlConfigValue(value) {
+  const text = String(value ?? '');
+  if (/[\r\n]/.test(text)) throw new Error('curl配置值不能包含换行。');
+  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function parseCurlResponseHeaders(headerText) {
+  const blocks = String(headerText || '').split(/\r?\n\r?\n/)
+    .filter((block) => /^HTTP\/\d(?:\.\d)?\s+\d+/i.test(block.trim()));
+  const lines = (blocks.at(-1) || '').split(/\r?\n/).slice(1);
+  const headers = {};
+  for (const line of lines) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) continue;
+    const name = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    headers[name] = headers[name] ? `${headers[name]}, ${value}` : value;
+  }
+  return headers;
+}
+
+function executeCurl(invocation, deps = {}) {
+  const spawnFn = deps.spawnFn || spawn;
+  return new Promise((resolve, reject) => {
+    const child = spawnFn('curl', invocation.args, {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
+    child.once('error', reject);
+    child.once('close', (exitCode) => resolve({
+      exitCode: Number(exitCode),
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+    }));
+    child.stdin.end(invocation.stdinText);
+  });
+}
+
+async function requestWithCurl(url, options = {}, deps = {}) {
+  const randomUUIDFn = deps.randomUUIDFn || randomUUID;
+  const executeCurlFn = deps.executeCurlFn || ((invocation) => executeCurl(invocation, deps));
+  const readFileFn = deps.readFileFn || fsp.readFile;
+  const rmFn = deps.rmFn || fsp.rm;
+  const requestId = randomUUIDFn();
+  const marker = `__BBGU_CURL_${requestId}__`;
+  const headerPath = path.join(os.tmpdir(), `bbgu-curl-${process.pid}-${requestId}.headers`);
+  const timeoutMs = Number(options.timeoutMs) || BBGU_API_TIMEOUT_MS;
+  const configLines = [
+    'silent',
+    'show-error',
+    'http1.1',
+    'retry = "0"',
+    `request = ${quoteCurlConfigValue(options.method || 'GET')}`,
+    `url = ${quoteCurlConfigValue(url)}`,
+    `connect-timeout = ${quoteCurlConfigValue(Math.max(1, Math.ceil(timeoutMs / 2000)))}`,
+    `max-time = ${quoteCurlConfigValue(Math.max(1, Math.ceil(timeoutMs / 1000)))}`,
+    `dump-header = ${quoteCurlConfigValue(headerPath.replace(/\\/g, '/'))}`,
+    'output = "-"',
+    `write-out = ${quoteCurlConfigValue(`${marker}%{http_code}`)}`,
+  ];
+  if (options.proxyServer) {
+    configLines.push(`proxy = ${quoteCurlConfigValue(options.proxyServer)}`, 'noproxy = ""');
+  }
+  for (const [name, value] of Object.entries(options.headers || {})) {
+    configLines.push(`header = ${quoteCurlConfigValue(`${name}: ${value}`)}`);
+  }
+  if (options.body !== undefined && options.body !== null) {
+    configLines.push(`data-raw = ${quoteCurlConfigValue(options.body)}`);
+  }
+
+  const invocation = {
+    args: ['--config', '-'],
+    stdinText: `${configLines.join('\n')}\n`,
+    headerPath,
+  };
+  try {
+    const result = await executeCurlFn(invocation);
+    if (result.exitCode !== 0) {
+      const exitCode = Number(result.exitCode);
+      const stage = [5, 6, 7].includes(exitCode)
+        ? 'proxy-tcp'
+        : exitCode === 35 ? 'target-tls' : 'curl';
+      const details = clean(result.stderr || `curl exited with code ${exitCode}`)
+        .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+        .replace(/\beyJ[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*){1,2}\b/g, '[JWT REDACTED]');
+      const error = createStagedNetworkError(stage, new Error(`curl退出码${exitCode}: ${details}`));
+      error.code = `BBGU_CURL_${exitCode}`;
+      error.curlExitCode = exitCode;
+      throw error;
+    }
+    const stdout = String(result.stdout || '');
+    const markerIndex = stdout.lastIndexOf(marker);
+    if (markerIndex < 0) throw new Error('curl响应缺少HTTP状态标记。');
+    const status = Number.parseInt(stdout.slice(markerIndex + marker.length).trim(), 10);
+    if (!Number.isFinite(status)) throw new Error('curl返回了无效HTTP状态码。');
+    const headersText = Object.hasOwn(result, 'headersText')
+      ? result.headersText
+      : await readFileFn(headerPath, 'utf8');
+    return {
+      status,
+      text: stdout.slice(0, markerIndex),
+      headers: parseCurlResponseHeaders(headersText),
+      via: 'curl',
+    };
+  } finally {
+    await rmFn(headerPath, { force: true }).catch(() => undefined);
+  }
 }
 
 function fingerprintToken(token) {
@@ -1185,7 +1300,7 @@ function isNetworkTransportError(error) {
     if (current.message) details.push(String(current.message));
     current = current.cause;
   }
-  return /ECONN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ERR_HTTP_RESPONSE_(?:ABORTED|INCOMPLETE)|AbortError|\btimeout\b|timed out|TLS|socket|network|fetch failed|net::ERR_(?:CONNECTION|TIMED_OUT|TUNNEL|PROXY)/i.test(details.join('\n'));
+  return /BBGU_CURL_\d+|ECONN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ERR_HTTP_RESPONSE_(?:ABORTED|INCOMPLETE)|AbortError|\btimeout\b|timed out|TLS|socket|network|fetch failed|net::ERR_(?:CONNECTION|TIMED_OUT|TUNNEL|PROXY)/i.test(details.join('\n'));
 }
 
 function isSafeCasFailoverError(error) {
@@ -1418,111 +1533,10 @@ async function consumeWatchNetworkCooldown(config, nowMs = Date.now()) {
   return false;
 }
 
-function requestRefreshWithHttpsProxy(url, options, proxyServer) {
-  const target = new URL(url);
-  const proxy = new URL(proxyServer);
-  if (target.protocol !== 'https:') {
-    return Promise.reject(new Error(`Proxy refresh fallback only supports https URLs: ${target.protocol}`));
-  }
-  if (proxy.protocol !== 'http:') {
-    return Promise.reject(new Error(`Proxy refresh fallback only supports http proxy URLs: ${proxy.protocol}`));
-  }
-
-  return new Promise((resolve, reject) => {
-    const body = options.body || '';
-    const proxyPort = Number(proxy.port || 80);
-    const targetPort = Number(target.port || 443);
-    const targetHostPort = `${target.hostname}:${targetPort}`;
-    const proxyHost = proxy.hostname;
-    const proxyHeaders = [
-      `CONNECT ${targetHostPort} HTTP/1.1`,
-      `Host: ${targetHostPort}`,
-      'Proxy-Connection: keep-alive',
-    ];
-    if (proxy.username || proxy.password) {
-      const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64');
-      proxyHeaders.push(`Proxy-Authorization: Basic ${auth}`);
-    }
-
-    let settled = false;
-    let socket;
-    let connectBuffer = Buffer.alloc(0);
-    const finishReject = (error) => {
-      if (settled) return;
-      settled = true;
-      if (socket) socket.destroy();
-      reject(error);
-    };
-
-    socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
-      socket.write(`${proxyHeaders.join('\r\n')}\r\n\r\n`);
-    });
-    socket.setTimeout(options.timeoutMs, () => {
-      finishReject(new Error(`Proxy refresh CONNECT timeout after ${options.timeoutMs}ms`));
-    });
-    socket.on('error', (error) => finishReject(error));
-    socket.on('data', function onConnectData(chunk) {
-      connectBuffer = Buffer.concat([connectBuffer, chunk]);
-      const headerEnd = connectBuffer.indexOf('\r\n\r\n');
-      if (headerEnd === -1) return;
-
-      socket.off('data', onConnectData);
-      const headerText = connectBuffer.slice(0, headerEnd).toString('latin1');
-      const leftover = connectBuffer.slice(headerEnd + 4);
-      const statusMatch = headerText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/i);
-      const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
-      if (statusCode !== 200) {
-        finishReject(new Error(`Proxy refresh CONNECT failed with status ${statusCode || 'unknown'}`));
-        return;
-      }
-      if (leftover.length) socket.unshift(leftover);
-
-      const secureSocket = tls.connect({
-        socket,
-        servername: target.hostname,
-        ALPNProtocols: ['http/1.1'],
-      }, () => {
-        const request = https.request({
-          protocol: 'https:',
-          hostname: target.hostname,
-          port: targetPort,
-          path: `${target.pathname}${target.search}`,
-          method: options.method || 'POST',
-          headers: {
-            ...options.headers,
-            'content-length': Buffer.byteLength(body),
-          },
-          timeout: options.timeoutMs,
-          agent: false,
-          createConnection: () => secureSocket,
-          insecureHTTPParser: true,
-        }, (response) => {
-          readRefreshResponse(response).then(({ status, text }) => {
-            if (settled) return;
-            settled = true;
-            resolve({
-              ok: status >= 200 && status < 300,
-              status,
-              text: async () => text,
-            });
-          }, finishReject);
-        });
-
-        request.on('timeout', () => {
-          request.destroy(new Error(`Proxy refresh HTTPS request timeout after ${options.timeoutMs}ms`));
-        });
-        request.on('error', (error) => finishReject(error));
-        request.write(body);
-        request.end();
-      });
-      secureSocket.on('error', (error) => finishReject(error));
-    });
-  });
-}
-
 async function requestRefreshedAuthState(config, current, deps = {}) {
   const fetchFn = deps.fetchFn || fetch;
-  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || (!deps.fetchFn ? requestRefreshWithHttpsProxy : null);
+  const curlRequestFn = deps.curlRequestFn || requestWithCurl;
+  const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
   const proxyServer = clean(deps.proxyServer || (config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
   const timeoutMs = deps.timeoutMs || BBGU_REFRESH_TIMEOUT_MS;
   const recordCurrentProxyFailureFn = deps.recordCurrentProxyFailureFn || ((error) => recordCurrentProxyFailure(config, error));
@@ -1549,22 +1563,28 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
       body,
       signal: controller.signal,
     };
-    const response = proxyServer && proxyHttpsRequestFn
-      ? await proxyHttpsRequestFn(url, {
+    const response = proxyServer
+      ? await withProxyFailoverFn(config, () => curlRequestFn(url, {
         method: options.method,
         headers: options.headers,
         body,
         timeoutMs,
-      }, proxyServer)
+        proxyServer,
+      }), { shouldFailoverFn: isSafeApiFailoverError })
       : await fetchFn(url, options);
-    const text = await response.text();
+    const text = typeof response.text === 'function'
+      ? await response.text()
+      : String(response.text || '');
     let payload;
     try {
       payload = JSON.parse(text);
     } catch {
       payload = null;
     }
-    if (!response.ok || !payload || !payload.access_token) {
+    const responseOk = typeof response.ok === 'boolean'
+      ? response.ok
+      : response.status >= 200 && response.status < 300;
+    if (!responseOk || !payload || !payload.access_token) {
       const oauthError = clean(payload && payload.error).toLowerCase();
       const oauthErrorDescription = firstNonEmpty(
         payload && payload.error_description,
@@ -1670,12 +1690,14 @@ function createScoreApiError(message, response) {
 
 async function fetchBbguScoreRows(config, deps = {}) {
   const requestJsonTextFn = deps.requestJsonTextFn || requestJsonText;
-  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const curlRequestFn = deps.curlRequestFn || requestWithCurl;
   const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
   const headers = buildBbguApiHeaders(config);
   const proxyServer = clean((config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
   const response = proxyServer
-    ? await withProxyFailoverFn(config, () => proxyHttpsRequestFn(BBGU_SCORE_API_URL, headers, proxyServer))
+    ? await withProxyFailoverFn(config, () => curlRequestFn(BBGU_SCORE_API_URL, {
+      method: 'GET', headers, proxyServer, timeoutMs: BBGU_API_TIMEOUT_MS,
+    }))
     : await requestJsonTextFn(BBGU_SCORE_API_URL, headers);
 
   const text = response.text;
@@ -1706,14 +1728,16 @@ async function fetchBbguScoreRows(config, deps = {}) {
 
 async function fetchBbguSubScores(scoreId, config, deps = {}) {
   const requestJsonTextFn = deps.requestJsonTextFn || requestJsonText;
-  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const curlRequestFn = deps.curlRequestFn || requestWithCurl;
   const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
   const origin = getBbguOrigin(config);
   const url = `${origin}${BBGU_SUBSCORE_API_PATH}?scoreId=${encodeURIComponent(scoreId)}`;
   const headers = buildBbguApiHeaders(config, '/sam/home');
   const proxyServer = clean((config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
   const response = proxyServer
-    ? await withProxyFailoverFn(config, () => proxyHttpsRequestFn(url, headers, proxyServer))
+    ? await withProxyFailoverFn(config, () => curlRequestFn(url, {
+      method: 'GET', headers, proxyServer, timeoutMs: BBGU_API_TIMEOUT_MS,
+    }))
     : await requestJsonTextFn(url, headers);
   return parseBbguSubscoreResponse(response);
 }
@@ -3521,6 +3545,7 @@ module.exports = {
   recoverDirectApiAfterAuthExpired,
   fetchBbguScoreRows,
   requestJsonText,
+  requestWithCurl,
   requestJsonTextWithHttpsProxy,
   run,
   runLogin,

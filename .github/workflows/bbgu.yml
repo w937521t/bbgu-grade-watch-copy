@@ -46,13 +46,25 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: 恢复加密状态
+        id: restore_state
         env:
           BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
         run: |
           set -euo pipefail
           mkdir -p "$BBGU_DATA_DIR"
-          git fetch origin '+refs/heads/state:refs/remotes/origin/state' || true
-          if git cat-file -e 'refs/remotes/origin/state:bbgu-state.enc' 2>/dev/null; then
+          state_remote_sha=""
+          state_remote_line="$(git ls-remote --heads origin refs/heads/state)"
+          if [[ -n "$state_remote_line" ]]; then
+            read -r state_remote_sha _ <<< "$state_remote_line"
+            git fetch origin '+refs/heads/state:refs/remotes/origin/state'
+            if [[ "$(git rev-parse refs/remotes/origin/state)" != "$state_remote_sha" ]]; then
+              echo '[BBGU] state分支在恢复期间发生变化，本次停止运行。' >&2
+              exit 1
+            fi
+            if ! git cat-file -e 'refs/remotes/origin/state:bbgu-state.enc' 2>/dev/null; then
+              echo '[BBGU] state分支缺少bbgu-state.enc，本次停止运行。' >&2
+              exit 1
+            fi
             git show 'refs/remotes/origin/state:bbgu-state.enc' > "$RUNNER_TEMP/bbgu-state.enc"
             node scripts/state-crypto.js decrypt "$RUNNER_TEMP/bbgu-state.enc" "$RUNNER_TEMP/bbgu-state.tar.gz"
             tar -xzf "$RUNNER_TEMP/bbgu-state.tar.gz" -C "$BBGU_DATA_DIR"
@@ -60,6 +72,7 @@ jobs:
           else
             echo '[BBGU] 未发现state分支，首次运行请选择login。'
           fi
+          echo "state_remote_sha=$state_remote_sha" >> "$GITHUB_OUTPUT"
 
       - name: 启动并验证Mihomo代理
         env:
@@ -74,6 +87,7 @@ jobs:
           fi
 
           mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
+          mihomo_image="docker.io/metacubex/mihomo@sha256:28ce3e89d0c9068cbd99a61d2c596db2d239b01f07135ac8b6ad81bcba307984"
           mkdir -p "$mihomo_dir/providers"
           mihomo_controller="http://127.0.0.1:9090"
           mihomo_provider="$mihomo_controller/providers/proxies/airport"
@@ -116,10 +130,10 @@ jobs:
             - MATCH,BBGU-STICKY
           EOF
 
-          docker pull docker.io/metacubex/mihomo:Alpha
+          docker pull "$mihomo_image"
           docker run -d --name bbgu-mihomo --network host \
             -v "$mihomo_dir:/root/.config/mihomo" \
-            docker.io/metacubex/mihomo:Alpha >/dev/null
+            "$mihomo_image" >/dev/null
 
           for attempt in {1..12}; do
             if curl -fsS "$mihomo_controller/proxies/$proxy_group" >/dev/null 2>&1; then
@@ -251,6 +265,7 @@ jobs:
         if: always()
         env:
           BBGU_STATE_PASSWORD: ${{ secrets.BBGU_STATE_PASSWORD }}
+          BBGU_STATE_BASE_SHA: ${{ steps.restore_state.outputs.state_remote_sha }}
         run: |
           set -euo pipefail
           names=(
@@ -275,22 +290,18 @@ jobs:
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git fetch origin '+refs/heads/state:refs/remotes/origin/state' || true
           state_worktree="$RUNNER_TEMP/bbgu-state-branch"
           trap 'git worktree remove --force "$state_worktree" >/dev/null 2>&1 || true' EXIT
 
-          if git show-ref --verify --quiet refs/remotes/origin/state; then
-            git worktree add -b state-update "$state_worktree" origin/state
-          else
-            git worktree add --detach "$state_worktree" HEAD
-            git -C "$state_worktree" switch --orphan state-update
-            git -C "$state_worktree" rm -rf --ignore-unmatch .
-          fi
+          git worktree add --detach "$state_worktree" HEAD
+          git -C "$state_worktree" switch --orphan state-update
+          git -C "$state_worktree" rm -rf --ignore-unmatch .
 
           cp "$RUNNER_TEMP/bbgu-state.enc" "$state_worktree/bbgu-state.enc"
           git -C "$state_worktree" add bbgu-state.enc
           git -C "$state_worktree" commit -m 'chore: update encrypted BBGU state'
-          git -C "$state_worktree" push origin HEAD:state
+          state_lease="refs/heads/state:${BBGU_STATE_BASE_SHA:-}"
+          git -C "$state_worktree" push --force-with-lease="$state_lease" origin HEAD:state
 
       - name: Mihomo诊断日志
         if: steps.run_bbgu.outcome == 'failure'

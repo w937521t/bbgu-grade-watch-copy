@@ -7,6 +7,7 @@ const path = require('node:path');
 const bbguGradeWatch = require('./bbgu_grade_watch');
 const {
   normalizeGradeRows,
+  migrateSnapshotGradeKeys,
   diffGrades,
   formatGradeNotification,
   normalizeSubScoreList,
@@ -14,6 +15,7 @@ const {
   selectRowsForSubScoreFetch,
   enrichRowsWithSubScores,
   sendPushPlus,
+  fetchWithTimeout,
   parseBooleanEnv,
   parsePositiveIntegerEnv,
   normalizeBbguScoreApiData,
@@ -34,6 +36,7 @@ const {
   readQrReminderState,
   saveQrReminderSchedule,
   markCasExpired,
+  markRefreshExpired,
   clearQrReminderSchedule,
   clearQrReminderState,
   extractAuthStateFromPage,
@@ -54,6 +57,7 @@ const {
   extractWeixinQrInfoFromHtml,
   extractWeixinQrConnectUrlFromHtml,
   recoverDirectApiAfterAuthExpired,
+  maybeRunScheduledQr,
   requestJsonText,
   run,
   runRenew,
@@ -97,43 +101,43 @@ test('formatAuthStatusSummary在JWT没有exp时显示到期时间未知', () => 
   assert.match(text, /Access Token：状态未知，到期时间未知/);
 });
 
-test('白天Access过期时使用之前最后一个整点作为扫码时间', () => {
+test('白天Access过期时使用之前最后一个实际查询时刻作为扫码时间', () => {
   const now = Date.parse('2026-07-04T15:30:00+08:00');
   const expiry = Date.parse('2026-07-04T17:34:00+08:00') / 1000;
   const result = computeQrSchedule(expiry, now);
 
-  assert.equal(result.dueAt, Date.parse('2026-07-04T17:00:00+08:00'));
-  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-04T18:00:00+08:00'));
+  assert.equal(result.dueAt, Date.parse('2026-07-04T17:07:00+08:00'));
+  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-04T18:07:00+08:00'));
 });
 
-test('跨夜提醒移动到次日09:30', () => {
+test('跨夜提醒移动到次日09:37', () => {
   const now = Date.parse('2026-07-04T23:30:00+08:00');
   const expiry = Date.parse('2026-07-05T09:34:00+08:00') / 1000;
   const result = computeQrSchedule(expiry, now);
 
-  assert.equal(result.dueAt, Date.parse('2026-07-05T09:30:00+08:00'));
-  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-05T10:00:00+08:00'));
+  assert.equal(result.dueAt, Date.parse('2026-07-05T09:37:00+08:00'));
+  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-05T10:07:00+08:00'));
   assert.equal(shouldPushQrNow({ nowMs: now, dueAtMs: result.dueAt, lastPushedAtMs: 0 }), false);
 });
 
-test('Access在10:34过期时等待10:00查询完成', () => {
+test('Access在10:34过期时等待10:07查询完成', () => {
   const now = Date.parse('2026-07-05T09:30:00+08:00');
   const expiry = Date.parse('2026-07-05T10:34:00+08:00') / 1000;
   const result = computeQrSchedule(expiry, now);
 
-  assert.equal(result.dueAt, Date.parse('2026-07-05T10:00:00+08:00'));
-  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-05T11:00:00+08:00'));
+  assert.equal(result.dueAt, Date.parse('2026-07-05T10:07:00+08:00'));
+  assert.equal(result.firstUncoveredQueryAt, Date.parse('2026-07-05T11:07:00+08:00'));
 });
 
-test('允许09:30首发、10:00补发以及之后两小时冷却', () => {
-  const dueAt = Date.parse('2026-07-05T09:30:00+08:00');
-  const firstPush = Date.parse('2026-07-05T09:30:00+08:00');
-  const tenOClock = Date.parse('2026-07-05T10:00:00+08:00');
+test('允许09:37首发、10:07补发以及之后两小时冷却', () => {
+  const dueAt = Date.parse('2026-07-05T09:37:00+08:00');
+  const firstPush = Date.parse('2026-07-05T09:37:00+08:00');
+  const tenOClock = Date.parse('2026-07-05T10:07:00+08:00');
 
   assert.equal(shouldPushQrNow({ nowMs: firstPush, dueAtMs: dueAt, lastPushedAtMs: 0 }), true);
   assert.equal(shouldPushQrNow({ nowMs: tenOClock, dueAtMs: dueAt, lastPushedAtMs: firstPush }), true);
   assert.equal(shouldPushQrNow({ nowMs: Date.parse('2026-07-05T11:30:00+08:00'), dueAtMs: dueAt, lastPushedAtMs: tenOClock }), false);
-  assert.equal(shouldPushQrNow({ nowMs: Date.parse('2026-07-05T12:00:00+08:00'), dueAtMs: dueAt, lastPushedAtMs: tenOClock }), true);
+  assert.equal(shouldPushQrNow({ nowMs: Date.parse('2026-07-05T12:07:00+08:00'), dueAtMs: dueAt, lastPushedAtMs: tenOClock }), true);
 });
 
 test('持久化CAS失效和二维码冷却状态', async () => {
@@ -147,10 +151,12 @@ test('持久化CAS失效和二维码冷却状态', async () => {
     };
     await saveQrReminderSchedule(config, first);
     await markCasExpired(config);
+    await markRefreshExpired(config);
     let saved = await readQrReminderState(config);
     assert.equal(saved.accessExpiryEpochSeconds, first.accessExpiryEpochSeconds);
     assert.equal(saved.lastPushedAt, 0);
     assert.equal(saved.casExpired, true);
+    assert.equal(saved.refreshExpired, true);
 
     await saveQrReminderSchedule(config, { ...first, lastPushedAt: 12345 });
     saved = await readQrReminderState(config);
@@ -205,8 +211,49 @@ test('normalizeGradeRows keeps meaningful grade fields and ignores empty rows', 
   ]);
 
   assert.deepEqual(rows, [
-    { key: '高等数学', courseName: '高等数学', score: '95', credit: '4', term: '2026春' },
+    { key: '2026春::高等数学', courseName: '高等数学', score: '95', credit: '4', term: '2026春' },
   ]);
+});
+
+test('二维码生成失败前不写入冷却时间', async () => {
+  const calls = [];
+  const nowMs = Date.parse('2026-07-05T10:07:00+08:00');
+
+  await assert.rejects(
+    maybeRunScheduledQr({}, {
+      nowFn: () => nowMs,
+      readQrReminderStateFn: async () => ({ dueAt: nowMs - 1, lastPushedAt: 0 }),
+      saveQrReminderScheduleFn: async () => calls.push('save-cooldown'),
+      runLoginFn: async () => {
+        calls.push('login');
+        throw new Error('二维码提取失败');
+      },
+    }),
+    /二维码提取失败/
+  );
+
+  assert.deepEqual(calls, ['login']);
+});
+
+test('二维码发送成功后即使等待扫码超时也保留冷却时间', async () => {
+  const calls = [];
+  const nowMs = Date.parse('2026-07-05T10:07:00+08:00');
+
+  await assert.rejects(
+    maybeRunScheduledQr({}, {
+      nowFn: () => nowMs,
+      readQrReminderStateFn: async () => ({ dueAt: nowMs - 1, lastPushedAt: 0 }),
+      saveQrReminderScheduleFn: async (_config, state) => calls.push(`save:${state.lastPushedAt}`),
+      runLoginFn: async (_config, options) => {
+        calls.push('login');
+        await options.onQrSent();
+        throw new Error('扫码超时');
+      },
+    }),
+    /扫码超时/
+  );
+
+  assert.deepEqual(calls, ['login', `save:${nowMs}`]);
 });
 
 test('normalizeGradeRows builds stable keys with course code when present', () => {
@@ -214,7 +261,31 @@ test('normalizeGradeRows builds stable keys with course code when present', () =
     { courseCode: 'AI101', courseName: '人工智能公开课', score: '100', credit: '2', term: '2026春' },
   ]);
 
-  assert.equal(rows[0].key, 'AI101::人工智能公开课');
+  assert.equal(rows[0].key, '2026春::AI101::人工智能公开课');
+});
+
+test('成绩键包含学期以区分重修课程', () => {
+  const rows = normalizeGradeRows([
+    { courseCode: 'A001', courseName: '高等数学', score: '80', term: '2025春' },
+    { courseCode: 'A001', courseName: '高等数学', score: '90', term: '2026春' },
+  ]);
+
+  assert.deepEqual(rows.map((row) => row.key), [
+    '2025春::A001::高等数学',
+    '2026春::A001::高等数学',
+  ]);
+});
+
+test('旧快照成绩键迁移后不会把现有成绩误报为新增', () => {
+  const previous = migrateSnapshotGradeKeys([
+    { key: 'A001::高等数学', courseName: '高等数学', score: '90', credit: '4', term: '2026春' },
+  ]);
+  const current = normalizeGradeRows([
+    { courseCode: 'A001', courseName: '高等数学', score: '90', credit: '4', term: '2026春' },
+  ]);
+
+  assert.equal(previous[0].key, '2026春::A001::高等数学');
+  assert.deepEqual(diffGrades(previous, current), { added: [], changed: [] });
 });
 
 test('diffGrades reports added and changed rows', () => {
@@ -365,6 +436,39 @@ test('sendPushPlus sends markdown template messages', async () => {
   }
 });
 
+test('fetchWithTimeout会中止并拒绝超时请求', async () => {
+  await assert.rejects(
+    fetchWithTimeout(
+      async (_url, options) => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+      }),
+      'https://example.test/hang',
+      {},
+      5,
+      '测试请求'
+    ),
+    /测试请求在5毫秒后超时/
+  );
+});
+
+test('sendPushPlus使用可配置超时', async () => {
+  await assert.rejects(
+    sendPushPlus({
+      token: 'push-token',
+      title: 'title',
+      content: 'content',
+      timeoutMs: 5,
+      fetchFn: async (_url, options) => {
+        if (!options.signal) throw new Error('PushPlus请求缺少AbortSignal');
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+      },
+    }),
+    /PushPlus请求在5毫秒后超时/
+  );
+});
+
 test('requestJsonText在GitHub代理模式下不回退到直连HTTPS', async () => {
   const originalFetch = global.fetch;
   const originalGithubActions = process.env.GITHUB_ACTIONS;
@@ -435,6 +539,28 @@ test('requestJsonText在代理模式下遇到fetch严格解析错误时改用代
   }
 });
 
+test('requestJsonText限制首选fetch请求时间', async () => {
+  const previousGithubActions = process.env.GITHUB_ACTIONS;
+  process.env.GITHUB_ACTIONS = 'true';
+  try {
+    await assert.rejects(
+      requestJsonText('https://zhjw.bbgu.edu.cn/api/sam/score/student/score', {}, {
+        timeoutMs: 5,
+        fetchFn: async (_url, options) => {
+          if (!options.signal) throw new Error('成绩请求缺少AbortSignal');
+          return new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+          });
+        },
+      }),
+      /成绩接口请求在5毫秒后超时/
+    );
+  } finally {
+    if (previousGithubActions === undefined) delete process.env.GITHUB_ACTIONS;
+    else process.env.GITHUB_ACTIONS = previousGithubActions;
+  }
+});
+
 test('calculateTermArithmeticAverage only uses numeric scores from selected term', () => {
   assert.deepEqual(calculateTermArithmeticAverage([
     { courseName: 'A', score: '99', term: '2026春' },
@@ -485,7 +611,7 @@ test('normalizeBbguScoreApiData converts real BBGU score response shape', () => 
 
   assert.deepEqual(rows, [
     {
-      key: '5600214a105::中外航海文化',
+      key: '2026春::5600214a105::中外航海文化',
       courseName: '中外航海文化',
       scoreId: '25201881',
       score: '99',
@@ -994,7 +1120,7 @@ test('recoverDirectApiAfterAuthExpired schedules QR from last access expiry afte
     /二维码提醒仍在冷却期/
   );
 
-  assert.deepEqual(calls, ['refresh', 'schedule:2026-07-04T09:00:00.000Z', 'scheduled-qr']);
+  assert.deepEqual(calls, ['refresh', 'schedule:2026-07-04T09:07:00.000Z', 'scheduled-qr']);
 });
 
 test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', async () => {
@@ -1007,9 +1133,7 @@ test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', as
     recoverDirectApiAfterAuthExpired(config, {
       refreshAndSaveAuthStateFn: async () => {
         calls.push('refresh');
-        const error = new Error('Refresh已失效');
-        error.httpStatus = 401;
-        throw error;
+        throw new Error('已有二维码计划时不应再次请求Refresh');
       },
       readQrReminderStateFn: async () => ({
         dueAt: Date.parse('2026-07-04T17:00:00+08:00'),
@@ -1025,7 +1149,33 @@ test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', as
     /二维码提醒仍在冷却期/
   );
 
-  assert.deepEqual(calls, ['refresh', 'scheduled-qr']);
+  assert.deepEqual(calls, ['scheduled-qr']);
+});
+
+test('普通查询已有Refresh失效记录时不再请求Refresh', async () => {
+  const calls = [];
+  const config = { tokenPath: 'token.env' };
+
+  await assert.rejects(
+    recoverDirectApiAfterAuthExpired(config, {
+      refreshAndSaveAuthStateFn: async () => {
+        calls.push('refresh');
+        throw new Error('Refresh不应被调用');
+      },
+      readQrReminderStateFn: async () => ({
+        refreshExpired: true,
+        dueAt: Date.parse('2026-07-04T17:07:00+08:00'),
+        lastPushedAt: Date.parse('2026-07-04T17:07:00+08:00'),
+      }),
+      maybeRunScheduledQrFn: async () => {
+        calls.push('scheduled-qr');
+        return { status: 'qr_pending' };
+      },
+    }),
+    /二维码提醒仍在冷却期/
+  );
+
+  assert.deepEqual(calls, ['scheduled-qr']);
 });
 
 test('run starts automatic login recovery when saved direct API token is expired', async () => {
@@ -1134,6 +1284,74 @@ test('成绩处理成功后检查待处理二维码提醒', async () => {
   assert.deepEqual(result, { status: 'ok' });
 });
 
+test('成绩处理失败时仍检查二维码并保留原始错误', async () => {
+  const calls = [];
+  const gradeError = new Error('成绩快照写入失败');
+  const config = {
+    pushplusToken: 'push-token',
+    tokenPath: 'token.env',
+    authorization: 'Bearer current-token',
+    term: '2026春',
+  };
+
+  await assert.rejects(
+    run(config, {
+      fetchScoreRowsFn: async () => [
+        { key: 'A', courseName: 'A', score: '99', term: '2026春' },
+      ],
+      processGradeRowsFn: async () => {
+        calls.push('grades');
+        throw gradeError;
+      },
+      maybeRunScheduledQrFn: async () => {
+        calls.push('qr-check');
+        return { status: 'qr_pending' };
+      },
+    }),
+    (error) => error === gradeError
+  );
+
+  assert.deepEqual(calls, ['grades', 'qr-check']);
+});
+
+test('成绩和二维码检查同时失败时优先抛出成绩错误并记录二维码错误', async () => {
+  const calls = [];
+  const logs = [];
+  const gradeError = new Error('成绩快照写入失败');
+  const qrError = new Error('二维码推送失败');
+  const originalConsoleError = console.error;
+  console.error = (message) => logs.push(String(message));
+
+  try {
+    await assert.rejects(
+      run({
+        pushplusToken: 'push-token',
+        tokenPath: 'token.env',
+        authorization: 'Bearer current-token',
+        term: '2026春',
+      }, {
+        fetchScoreRowsFn: async () => [
+          { key: 'A', courseName: 'A', score: '99', term: '2026春' },
+        ],
+        processGradeRowsFn: async () => {
+          calls.push('grades');
+          throw gradeError;
+        },
+        maybeRunScheduledQrFn: async () => {
+          calls.push('qr-check');
+          throw qrError;
+        },
+      }),
+      (error) => error === gradeError
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.deepEqual(calls, ['grades', 'qr-check']);
+  assert.match(logs.join('\n'), /二维码检查也失败.*二维码推送失败/);
+});
+
 test('CAS续期成功后renew结束并清除待扫码状态', async () => {
   const calls = [];
   const logs = [];
@@ -1197,6 +1415,45 @@ test('CAS已记录失效后renew跳过CAS并直接使用Refresh', async () => {
   assert.match(logs.join('\n'), /Access Token：有效/);
 });
 
+test('watch缺少BBGU_TERM时在请求成绩前立即失败', async () => {
+  const calls = [];
+  await assert.rejects(
+    run({
+      pushplusToken: 'push-token',
+      tokenPath: 'token.env',
+      authorization: 'Bearer current-token',
+      term: '',
+    }, {
+      fetchScoreRowsFn: async () => calls.push('fetch'),
+    }),
+    /Missing BBGU_TERM/
+  );
+
+  assert.deepEqual(calls, []);
+});
+
+test('CAS和Refresh均已记录失效后renew跳过两种续期请求', async () => {
+  const calls = [];
+  const result = await runRenew({ tokenPath: 'token.env' }, {
+    readQrReminderStateFn: async () => ({
+      casExpired: true,
+      refreshExpired: true,
+      dueAt: Date.parse('2026-07-05T17:07:00+08:00'),
+    }),
+    runSilentRenewFn: async () => calls.push('cas'),
+    refreshAndSaveAuthStateFn: async () => calls.push('refresh'),
+    readSavedAuthStateFn: async () => ({ accessToken: 'old-access', refreshToken: 'old-refresh' }),
+    maybeRunScheduledQrFn: async () => {
+      calls.push('check-qr');
+      return { status: 'qr_pending' };
+    },
+    logFn: () => undefined,
+  });
+
+  assert.deepEqual(calls, ['check-qr']);
+  assert.equal(result.status, 'qr_pending');
+});
+
 test('CAS和Refresh都失效后renew根据最后一枚Access安排扫码', async () => {
   const calls = [];
   const logs = [];
@@ -1222,7 +1479,7 @@ test('CAS和Refresh都失效后renew根据最后一枚Access安排扫码', async
     logFn: (message) => logs.push(message),
   });
 
-  assert.deepEqual(calls, ['refresh', 'due:2026-07-04T09:00:00.000Z', 'check-qr']);
+  assert.deepEqual(calls, ['refresh', 'due:2026-07-04T09:07:00.000Z', 'check-qr']);
   assert.equal(result.status, 'qr_pending');
   assert.match(logs.join('\n'), /CAS：已失效，本次已跳过/);
   assert.match(logs.join('\n'), /Refresh Token：已失效/);
@@ -1256,6 +1513,107 @@ test('renew遇到Refresh服务器故障时不安排二维码', async () => {
   );
 
   assert.deepEqual(calls, ['refresh']);
+});
+
+test('renew不会把没有明确Token失效信息的Refresh 400或403永久判死', async () => {
+  for (const httpStatus of [400, 403]) {
+    const calls = [];
+    const error = new Error(`authserver HTTP ${httpStatus}`);
+    error.httpStatus = httpStatus;
+
+    await assert.rejects(
+      runRenew({ tokenPath: 'token.env' }, {
+        readQrReminderStateFn: async () => ({ casExpired: true }),
+        refreshAndSaveAuthStateFn: async () => {
+          calls.push('refresh');
+          throw error;
+        },
+        markRefreshExpiredFn: async () => {
+          calls.push('mark-refresh-expired');
+          return { casExpired: true, refreshExpired: true };
+        },
+        readSavedAuthStateFn: async () => {
+          calls.push('read-token');
+          return { accessToken: '', refreshToken: '' };
+        },
+        saveQrReminderScheduleFn: async () => calls.push('schedule'),
+        maybeRunScheduledQrFn: async () => calls.push('check-qr'),
+        logFn: () => undefined,
+      }),
+      (actual) => actual === error
+    );
+
+    assert.deepEqual(calls, ['refresh']);
+  }
+});
+
+test('renew仍会把明确invalid_grant的Refresh 400永久判死', async () => {
+  const calls = [];
+  const error = new Error('refresh invalid_grant');
+  error.httpStatus = 400;
+  error.oauthError = 'invalid_grant';
+
+  const result = await runRenew({ tokenPath: 'token.env' }, {
+    nowFn: () => Date.parse('2026-07-04T15:30:00+08:00'),
+    readQrReminderStateFn: async () => ({ casExpired: true }),
+    refreshAndSaveAuthStateFn: async () => {
+      calls.push('refresh');
+      throw error;
+    },
+    markRefreshExpiredFn: async () => {
+      calls.push('mark-refresh-expired');
+      return { casExpired: true, refreshExpired: true };
+    },
+    readSavedAuthStateFn: async () => ({
+      accessToken: makeJwt({ exp: Date.parse('2026-07-04T17:34:00+08:00') / 1000 }),
+      refreshToken: '',
+    }),
+    saveQrReminderScheduleFn: async (_config, schedule) => {
+      calls.push('schedule');
+      return schedule;
+    },
+    maybeRunScheduledQrFn: async () => {
+      calls.push('check-qr');
+      return { status: 'qr_pending' };
+    },
+    logFn: () => undefined,
+  });
+
+  assert.deepEqual(calls, ['refresh', 'mark-refresh-expired', 'schedule', 'check-qr']);
+  assert.equal(result.status, 'qr_pending');
+});
+
+test('renew不会忽略OAuth描述中的明确Refresh过期信息', async () => {
+  const calls = [];
+  const error = new Error('refresh invalid_request');
+  error.httpStatus = 400;
+  error.oauthError = 'invalid_request';
+  error.oauthErrorDescription = 'Refresh token expired';
+
+  const result = await runRenew({ tokenPath: 'token.env' }, {
+    readQrReminderStateFn: async () => ({ casExpired: true }),
+    refreshAndSaveAuthStateFn: async () => {
+      calls.push('refresh');
+      throw error;
+    },
+    markRefreshExpiredFn: async () => {
+      calls.push('mark-refresh-expired');
+      return {
+        casExpired: true,
+        refreshExpired: true,
+        dueAt: Date.parse('2026-07-04T17:07:00+08:00'),
+      };
+    },
+    readSavedAuthStateFn: async () => ({ accessToken: '', refreshToken: '' }),
+    maybeRunScheduledQrFn: async () => {
+      calls.push('check-qr');
+      return { status: 'qr_pending' };
+    },
+    logFn: () => undefined,
+  });
+
+  assert.deepEqual(calls, ['refresh', 'mark-refresh-expired', 'check-qr']);
+  assert.equal(result.status, 'qr_pending');
 });
 
 test('clearBrowserAccessTokens removes saved CQU access token keys', async () => {
@@ -1367,6 +1725,29 @@ test('requestRefreshedAuthState posts verified form and keeps old refresh token 
   assert.match(calls[0].options.body, /grant_type=refresh_token/);
   assert.match(calls[0].options.body, /refresh_token=old.refresh/);
   assert.equal(calls[0].options.headers['content-type'], 'application/x-www-form-urlencoded');
+});
+
+test('requestRefreshedAuthState保留OAuth错误类型供失效判断', async () => {
+  await assert.rejects(
+    requestRefreshedAuthState(
+      { homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home' },
+      { accessToken: 'old.access', refreshToken: 'old.refresh' },
+      {
+        fetchFn: async () => ({
+          ok: false,
+          status: 400,
+          text: async () => JSON.stringify({
+            error: 'invalid_grant',
+            error_description: 'Refresh token expired',
+          }),
+        }),
+        timeoutMs: 50,
+      }
+    ),
+    (error) => error.httpStatus === 400
+      && error.oauthError === 'invalid_grant'
+      && error.oauthErrorDescription === 'Refresh token expired'
+  );
 });
 
 test('Refresh内置请求失败后优先通过Mihomo代理HTTPS后备路径', async () => {

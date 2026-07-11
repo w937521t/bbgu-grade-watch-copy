@@ -17,6 +17,9 @@ const BBGU_BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 const BBGU_OAUTH_CLIENT_ID = 'sam-prd';
 const BBGU_OAUTH_CLIENT_SECRET = 'app-a-1234';
 const BBGU_REFRESH_TIMEOUT_MS = 15000;
+const BBGU_API_TIMEOUT_MS = 30000;
+const PUSHPLUS_TIMEOUT_MS = 30000;
+const QR_METADATA_TIMEOUT_MS = 15000;
 const PUSHPLUS_CONTENT_MAX_CHARS = 19000;
 const SUBSCORE_LIST_KEYS = ['subScoreList', 'detailScoreList', 'scoreItemList'];
 const SUBSCORE_NAME_FIELDS = ['subName', 'scoreName', 'itemName', 'name', 'componentName', 'partName', 'assessmentName', 'subScoreName', '项目', '名称'];
@@ -69,6 +72,28 @@ function unquoteToken(value) {
 function buildAuthorizationHeader(accessToken) {
   const token = unquoteToken(accessToken);
   return token ? `Bearer ${token}` : '';
+}
+
+async function fetchWithTimeout(fetchFn, url, options, timeoutMs, label) {
+  const controller = new AbortController();
+  const timeoutError = new Error(`${label}在${timeoutMs}毫秒后超时。`);
+  timeoutError.code = 'BBGU_REQUEST_TIMEOUT';
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => fetchFn(url, { ...options, signal: controller.signal })),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function emptyAuthState() {
@@ -161,6 +186,7 @@ function formatAuthStatusSummary({ casStatus, refreshStatus, authState = {}, now
   const refreshText = {
     valid: '有效',
     expired: '已失效',
+    expired_skipped: '已失效，本次已跳过',
     unchecked: '未检测',
   }[refreshStatus] || '未检测';
 
@@ -183,6 +209,7 @@ const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const QR_REMINDER_COOLDOWN_MS = 2 * HOUR_MS;
+const GRADE_QUERY_MINUTE = 7;
 
 function beijingTimeParts(epochMs) {
   const shifted = new Date(epochMs + BEIJING_OFFSET_MS);
@@ -215,7 +242,8 @@ function scheduledGradeQueriesFrom(nowMs, dayCount = 3) {
         date.getUTCFullYear(),
         date.getUTCMonth() + 1,
         date.getUTCDate(),
-        hour
+        hour,
+        GRADE_QUERY_MINUTE
       );
       if (epoch >= nowMs) result.push(epoch);
     }
@@ -264,8 +292,9 @@ function normalizeGradeRows(rows) {
     if (!courseName && !courseCode) continue;
     if (!score && !credit && !term) continue;
 
+    const baseKey = courseCode ? `${courseCode}::${courseName || courseCode}` : courseName;
     normalized.push({
-      key: courseCode ? `${courseCode}::${courseName || courseCode}` : courseName,
+      key: term ? `${term}::${baseKey}` : baseKey,
       courseName: courseName || courseCode,
       ...(scoreId ? { scoreId } : {}),
       ...(!scoreId && Array.isArray(row.__bbguSourceKeys) ? { sourceKeys: row.__bbguSourceKeys.map(clean).filter(Boolean).sort() } : {}),
@@ -314,6 +343,15 @@ function gradeSignature(row) {
     score: row.score || '',
     credit: row.credit || '',
     term: row.term || '',
+  });
+}
+
+function migrateSnapshotGradeKeys(rows) {
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const key = clean(row && row.key);
+    const term = clean(row && row.term);
+    if (!key || !term || key.startsWith(`${term}::`)) return row;
+    return { ...row, key: `${term}::${key}` };
   });
 }
 
@@ -671,14 +709,24 @@ function extractWeixinQrConnectUrlFromHtml(html) {
 }
 
 async function fetchText(url, options = {}) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: {
-      'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-      ...options.headers,
+  const fetchFn = options.fetchFn || fetch;
+  const timeoutMs = options.timeoutMs || QR_METADATA_TIMEOUT_MS;
+  const { response, text } = await fetchWithTimeout(
+    async (targetUrl, requestOptions) => {
+      const response = await fetchFn(targetUrl, requestOptions);
+      return { response, text: await response.text() };
     },
-  });
-  const text = await response.text();
+    url,
+    {
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+        ...options.headers,
+      },
+    },
+    timeoutMs,
+    '二维码辅助请求'
+  );
   return { url: response.url || url, status: response.status, text };
 }
 
@@ -696,10 +744,20 @@ async function fetchWeixinQrInfoFromPage(page) {
     try {
       let qrConnectUrl = /^https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect/i.test(url) ? url : '';
       if (!qrConnectUrl && /combinedLogin\.do/i.test(url)) {
-        const combined = await page.evaluate(async (targetUrl) => {
-          const response = await fetch(targetUrl, { credentials: 'include', redirect: 'follow' });
-          return { url: response.url, text: await response.text() };
-        }, url).catch(async () => fetchText(url));
+        const combined = await page.evaluate(async ({ targetUrl, timeoutMs }) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(targetUrl, {
+              credentials: 'include',
+              redirect: 'follow',
+              signal: controller.signal,
+            });
+            return { url: response.url, text: await response.text() };
+          } finally {
+            clearTimeout(timer);
+          }
+        }, { targetUrl: url, timeoutMs: QR_METADATA_TIMEOUT_MS }).catch(async () => fetchText(url));
         qrConnectUrl = extractWeixinQrConnectUrlFromHtml(combined.text);
         if (!qrConnectUrl && /^https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect/i.test(combined.url)) {
           qrConnectUrl = combined.url;
@@ -880,6 +938,9 @@ async function saveQrReminderSchedule(config, schedule) {
     && previous.accessExpiryEpochSeconds === schedule.accessExpiryEpochSeconds;
   const next = {
     casExpired: Boolean(previous && previous.casExpired),
+    refreshExpired: Object.hasOwn(schedule, 'refreshExpired')
+      ? Boolean(schedule.refreshExpired)
+      : Boolean(previous && previous.refreshExpired),
     accessExpiryEpochSeconds: schedule.accessExpiryEpochSeconds,
     dueAt: schedule.dueAt,
     firstUncoveredQueryAt: schedule.firstUncoveredQueryAt,
@@ -895,6 +956,14 @@ async function markCasExpired(config) {
   if (!config || !config.qrReminderStatePath) return { casExpired: true };
   const previous = await readQrReminderState(config) || {};
   const next = { ...previous, casExpired: true };
+  await writeJson(config.qrReminderStatePath, next);
+  return next;
+}
+
+async function markRefreshExpired(config) {
+  if (!config || !config.qrReminderStatePath) return { refreshExpired: true };
+  const previous = await readQrReminderState(config) || {};
+  const next = { ...previous, refreshExpired: true };
   await writeJson(config.qrReminderStatePath, next);
   return next;
 }
@@ -915,19 +984,32 @@ async function clearQrReminderState(config) {
   await fsp.rm(config.qrReminderStatePath, { force: true });
 }
 
-async function sendPushPlus({ token, title, content }) {
-  const response = await fetch(PUSHPLUS_SEND_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      token,
-      title,
-      content,
-      template: 'markdown',
-    }),
-  });
-
-  const text = await response.text();
+async function sendPushPlus({
+  token,
+  title,
+  content,
+  fetchFn = fetch,
+  timeoutMs = PUSHPLUS_TIMEOUT_MS,
+}) {
+  const { response, text } = await fetchWithTimeout(
+    async (url, options) => {
+      const response = await fetchFn(url, options);
+      return { response, text: await response.text() };
+    },
+    PUSHPLUS_SEND_URL,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token,
+        title,
+        content,
+        template: 'markdown',
+      }),
+    },
+    timeoutMs,
+    'PushPlus请求'
+  );
   let body;
   try {
     body = JSON.parse(text);
@@ -1199,8 +1281,16 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
       payload = null;
     }
     if (!response.ok || !payload || !payload.access_token) {
-      const error = new Error(`BBGU refresh failed: HTTP ${response.status}`);
+      const oauthError = clean(payload && payload.error).toLowerCase();
+      const oauthErrorDescription = firstNonEmpty(
+        payload && payload.error_description,
+        payload && payload.message,
+        payload && payload.msg
+      );
+      const error = new Error(`BBGU refresh failed: HTTP ${response.status}${oauthError ? ` (${oauthError})` : ''}`);
       error.httpStatus = response.status;
+      if (oauthError) error.oauthError = oauthError;
+      if (oauthErrorDescription) error.oauthErrorDescription = oauthErrorDescription;
       throw error;
     }
     return {
@@ -1267,7 +1357,13 @@ function isAuthExpiredResponse({ httpStatus, text, body }) {
 function isTerminalRefreshAuthFailure(error) {
   if (error && error.code === 'BBGU_REFRESH_UNAVAILABLE') return true;
   const httpStatus = Number(error && error.httpStatus);
-  return httpStatus === 400 || httpStatus === 401 || httpStatus === 403;
+  if (httpStatus === 401) return true;
+  const details = [error && error.oauthError, error && error.oauthErrorDescription]
+    .map(clean)
+    .filter(Boolean)
+    .join(' ');
+  if (/^invalid_(?:grant|token)$/i.test(clean(error && error.oauthError))) return true;
+  return /(?:refresh\s*token|刷新令牌).*(?:expired|invalid|revoked|过期|失效|无效)|(?:expired|invalid|revoked|过期|失效|无效).*(?:refresh\s*token|刷新令牌)/i.test(details);
 }
 
 function getBbguOrigin(config) {
@@ -1372,11 +1468,21 @@ async function requestJsonText(url, headers, deps = {}) {
   const httpsRequestFn = deps.httpsRequestFn || requestJsonTextWithHttps;
   const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
   const proxyServer = clean(deps.proxyServer || process.env.BBGU_PROXY_SERVER || '');
+  const timeoutMs = deps.timeoutMs || BBGU_API_TIMEOUT_MS;
   try {
-    const response = await fetchFn(url, { method: 'GET', headers });
+    const { response, text } = await fetchWithTimeout(
+      async (targetUrl, options) => {
+        const response = await fetchFn(targetUrl, options);
+        return { response, text: await response.text() };
+      },
+      url,
+      { method: 'GET', headers },
+      timeoutMs,
+      '成绩接口请求'
+    );
     return {
       status: response.status,
-      text: await response.text(),
+      text,
       via: 'fetch',
     };
   } catch (error) {
@@ -1548,7 +1654,7 @@ async function processGradeRows(currentRows, config) {
     throw new Error('No grade rows were extracted from BBGU score API/page.');
   }
 
-  const previousRows = await readJson(config.snapshotPath, []);
+  const previousRows = migrateSnapshotGradeKeys(await readJson(config.snapshotPath, []));
   const rowsWithSavedSubScores = mergePersistedSubScores(previousRows, currentRows);
   const diff = diffGrades(previousRows, rowsWithSavedSubScores);
 
@@ -1874,25 +1980,34 @@ async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
     readQrReminderStateFn = readQrReminderState,
     readSavedAuthStateFn = readSavedAuthState,
     saveQrReminderScheduleFn = saveQrReminderSchedule,
+    markRefreshExpiredFn = markRefreshExpired,
     clearQrReminderScheduleFn = clearQrReminderSchedule,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
     fetchScoreRowsFn = fetchBbguScoreRows,
   } = deps;
 
-  try {
-    console.log('[BBGU] Access token expired; trying refresh token first.');
-    await refreshAndSaveAuthStateFn(config);
-    await clearQrReminderScheduleFn(config);
-    console.log('[BBGU] Refresh token renewal completed; retrying score API.');
-    return fetchScoreRowsFn(config);
-  } catch (error) {
-    console.log(`[BBGU] Refresh Token续Access失败。原因：${error.message || error}`);
-    if (!isTerminalRefreshAuthFailure(error)) {
-      throw error;
+  let renewalState = await readQrReminderStateFn(config);
+  const refreshKnownExpired = Boolean(
+    renewalState && (renewalState.refreshExpired || Number.isFinite(renewalState.dueAt))
+  );
+  if (!refreshKnownExpired) {
+    try {
+      console.log('[BBGU] Access token expired; trying refresh token first.');
+      await refreshAndSaveAuthStateFn(config);
+      await clearQrReminderScheduleFn(config);
+      console.log('[BBGU] Refresh token renewal completed; retrying score API.');
+      return fetchScoreRowsFn(config);
+    } catch (error) {
+      console.log(`[BBGU] Refresh Token续Access失败。原因：${error.message || error}`);
+      if (!isTerminalRefreshAuthFailure(error)) {
+        throw error;
+      }
+      renewalState = await markRefreshExpiredFn(config);
     }
+  } else {
+    console.log('[BBGU] Refresh Token已记录失效，本次跳过续期请求。');
   }
 
-  let renewalState = await readQrReminderStateFn(config);
   if (!renewalState || !Number.isFinite(renewalState.dueAt)) {
     const auth = await readSavedAuthStateFn(config.tokenPath);
     const expiry = extractJwtExpiry(auth.accessToken);
@@ -1927,6 +2042,9 @@ async function run(config = getConfig(), deps = {}) {
   if (!config.pushplusToken) {
     throw new Error('Missing PUSHPLUS_TOKEN. Set it in GitHub repository secrets.');
   }
+  if (!config.term) {
+    throw new Error('Missing BBGU_TERM. Set it in GitHub repository variables.');
+  }
 
   if (!config.authorization) {
     const auth = await readSavedAuthStateFn(config.tokenPath);
@@ -1937,8 +2055,22 @@ async function run(config = getConfig(), deps = {}) {
   }
 
   const finishGradeRun = async (rows) => {
-    const result = await processGradeRowsFn(rows, config);
-    await maybeRunScheduledQrFn(config);
+    let result;
+    let gradeError;
+    try {
+      result = await processGradeRowsFn(rows, config);
+    } catch (error) {
+      gradeError = error;
+    }
+
+    try {
+      await maybeRunScheduledQrFn(config);
+    } catch (qrError) {
+      if (!gradeError) throw qrError;
+      console.error(`[BBGU] 成绩处理失败后，二维码检查也失败：${qrError.message || qrError}`);
+    }
+
+    if (gradeError) throw gradeError;
     return result;
   };
 
@@ -1978,6 +2110,9 @@ async function runLogin(config = getConfig(), options = {}) {
     installPageRequestFailureCapture(page);
     const weixinQrCapture = createWeixinQrCapture(page);
     const ignoreInitialAccessToken = Boolean(options.ignoreInitialAccessToken);
+    const onQrSent = typeof options.onQrSent === 'function'
+      ? options.onQrSent
+      : async () => undefined;
     if (ignoreInitialAccessToken) {
       const origin = new URL(config.homeUrl).origin;
       await page.goto(`${origin}/sam/home`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => undefined);
@@ -2041,6 +2176,7 @@ async function runLogin(config = getConfig(), options = {}) {
           showScreenshotPath: !config.githubActions,
         }),
       });
+      await onQrSent();
       console.log(`[BBGU] QR login screenshot saved: ${screenshotPath}`);
       const loggedIn = await waitForAuthenticationAfterQr(page, config);
       if (!loggedIn) {
@@ -2078,8 +2214,12 @@ async function maybeRunScheduledQr(config, deps = {}) {
   })) {
     return { status: 'qr_pending', ...state };
   }
-  await saveQrReminderScheduleFn(config, { ...state, lastPushedAt: nowMs });
-  const result = await runLoginFn(config, { ignoreInitialAccessToken: true });
+  const result = await runLoginFn(config, {
+    ignoreInitialAccessToken: true,
+    onQrSent: async () => {
+      await saveQrReminderScheduleFn(config, { ...state, lastPushedAt: nowFn() });
+    },
+  });
   await clearQrReminderStateFn(config);
   return result;
 }
@@ -2095,6 +2235,7 @@ async function runRenew(config = getConfig(), deps = {}) {
     readQrReminderStateFn = readQrReminderState,
     runSilentRenewFn = runSilentRenew,
     markCasExpiredFn = markCasExpired,
+    markRefreshExpiredFn = markRefreshExpired,
     refreshAndSaveAuthStateFn = refreshAndSaveAuthState,
     readSavedAuthStateFn = readSavedAuthState,
     saveQrReminderScheduleFn = saveQrReminderSchedule,
@@ -2124,40 +2265,51 @@ async function runRenew(config = getConfig(), deps = {}) {
     }
   }
 
-  try {
-    const refreshResult = await refreshAndSaveAuthStateFn(config);
-    await clearQrReminderScheduleFn(config);
-    const authState = refreshResult && refreshResult.authState
-      ? refreshResult.authState
-      : refreshResult && (refreshResult.accessToken || refreshResult.refreshToken)
-        ? refreshResult
-        : await readSavedAuthStateFn(config.tokenPath);
-    logFn(formatAuthStatusSummary({
-      casStatus,
-      refreshStatus: 'valid',
-      authState,
-      nowMs: nowFn(),
-    }));
-    return { status: 'refresh_ok' };
-  } catch (refreshError) {
-    if (!isTerminalRefreshAuthFailure(refreshError)) {
-      console.log(`[BBGU] Refresh Token续Access临时失败，本次不安排二维码。原因：${refreshError.message || refreshError}`);
-      throw refreshError;
+  let currentRenewalState = renewalState;
+  const refreshKnownExpired = Boolean(
+    renewalState && (renewalState.refreshExpired || Number.isFinite(renewalState.dueAt))
+  );
+  if (!refreshKnownExpired) {
+    try {
+      const refreshResult = await refreshAndSaveAuthStateFn(config);
+      await clearQrReminderScheduleFn(config);
+      const authState = refreshResult && refreshResult.authState
+        ? refreshResult.authState
+        : refreshResult && (refreshResult.accessToken || refreshResult.refreshToken)
+          ? refreshResult
+          : await readSavedAuthStateFn(config.tokenPath);
+      logFn(formatAuthStatusSummary({
+        casStatus,
+        refreshStatus: 'valid',
+        authState,
+        nowMs: nowFn(),
+      }));
+      return { status: 'refresh_ok' };
+    } catch (refreshError) {
+      if (!isTerminalRefreshAuthFailure(refreshError)) {
+        console.log(`[BBGU] Refresh Token续Access临时失败，本次不安排二维码。原因：${refreshError.message || refreshError}`);
+        throw refreshError;
+      }
+      console.log(`[BBGU] Refresh Token失效，根据最后一枚Access的过期时间安排二维码。原因：${refreshError.message || refreshError}`);
+      currentRenewalState = await markRefreshExpiredFn(config);
     }
-    console.log(`[BBGU] Refresh Token失效，根据最后一枚Access的过期时间安排二维码。原因：${refreshError.message || refreshError}`);
+  } else {
+    console.log('[BBGU] Refresh Token已记录失效，本次跳过续期请求。');
   }
 
   const auth = await readSavedAuthStateFn(config.tokenPath);
   logFn(formatAuthStatusSummary({
     casStatus,
-    refreshStatus: 'expired',
+    refreshStatus: refreshKnownExpired ? 'expired_skipped' : 'expired',
     authState: auth,
     nowMs: nowFn(),
   }));
-  const expiry = extractJwtExpiry(auth.accessToken);
-  if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
-  const schedule = computeQrSchedule(expiry.epochSeconds, nowFn());
-  await saveQrReminderScheduleFn(config, schedule);
+  if (!currentRenewalState || !Number.isFinite(currentRenewalState.dueAt)) {
+    const expiry = extractJwtExpiry(auth.accessToken);
+    if (!expiry) throw new Error('保存的Access Token没有过期时间，无法安排二维码。');
+    const schedule = computeQrSchedule(expiry.epochSeconds, nowFn());
+    currentRenewalState = await saveQrReminderScheduleFn(config, schedule);
+  }
   return maybeRunScheduledQrFn(config, { nowFn });
 }
 
@@ -2185,6 +2337,7 @@ module.exports = {
   computeQrSchedule,
   shouldPushQrNow,
   normalizeGradeRows,
+  migrateSnapshotGradeKeys,
   diffGrades,
   normalizeSubScoreList,
   mergePersistedSubScores,
@@ -2204,6 +2357,7 @@ module.exports = {
   saveQrElementScreenshot,
   isLikelyQrLoginUrl,
   sendPushPlus,
+  fetchWithTimeout,
   parseBooleanEnv,
   parsePositiveIntegerEnv,
   buildCasRenewUrl,
@@ -2216,6 +2370,7 @@ module.exports = {
   readQrReminderState,
   saveQrReminderSchedule,
   markCasExpired,
+  markRefreshExpired,
   clearQrReminderSchedule,
   clearQrReminderState,
   requestRefreshedAuthState,

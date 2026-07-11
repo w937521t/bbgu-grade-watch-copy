@@ -17,6 +17,8 @@ test('Workflow保持GitHub定时并使用加密状态分支', () => {
   assert.match(yaml, /BBGU_STATE_PASSWORD: \$\{\{ secrets\.BBGU_STATE_PASSWORD \}\}/);
   assert.match(yaml, /bbgu-state\.enc/);
   assert.match(yaml, /bbgu_proxy_state\.json/);
+  assert.match(yaml, /git ls-remote --heads origin refs\/heads\/state/);
+  assert.doesNotMatch(yaml, /git fetch origin ['"]\+refs\/heads\/state:refs\/remotes\/origin\/state['"] \|\| true/);
   assert.match(yaml, /node bbgu_grade_watch\.js renew/);
   assert.match(yaml, /github\.event\.schedule \}\}" == '37 1-23\/2 \* \* \*'/);
   assert.match(yaml, /node bbgu_grade_watch\.js login/);
@@ -34,6 +36,25 @@ test('Workflow不持久化登录态明文', () => {
   assert.doesNotMatch(yaml, /git add .*bbgu_token\.env/);
   assert.match(yaml, /node scripts\/state-crypto\.js encrypt/);
   assert.match(yaml, /git -C "\$state_worktree" add bbgu-state\.enc/);
+});
+
+test('Workflow将state分支压缩为单个受保护根提交', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+
+  assert.match(yaml, /git -C "\$state_worktree" switch --orphan state-update/);
+  assert.match(yaml, /--force-with-lease="\$state_lease" origin HEAD:state/);
+  assert.doesNotMatch(yaml, /git worktree add -b state-update .* origin\/state/);
+  assert.doesNotMatch(yaml, /git -C "\$state_worktree" push origin HEAD:state/);
+});
+
+test('Workflow使用实际恢复的state版本保护整次任务期间的并发更新', () => {
+  const yaml = fs.readFileSync(workflowPath, 'utf8');
+
+  assert.match(yaml, /- name: 恢复加密状态\s+id: restore_state/);
+  assert.match(yaml, /echo "state_remote_sha=\$state_remote_sha" >> "\$GITHUB_OUTPUT"/);
+  assert.match(yaml, /BBGU_STATE_BASE_SHA: \$\{\{ steps\.restore_state\.outputs\.state_remote_sha \}\}/);
+  assert.match(yaml, /state_lease="refs\/heads\/state:\$\{BBGU_STATE_BASE_SHA:-\}"/);
+  assert.equal((yaml.match(/git ls-remote --heads origin refs\/heads\/state/g) || []).length, 1);
 });
 
 test('Workflow失败时只上传短期登录诊断', () => {
@@ -58,7 +79,9 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /CLASH_SUBSCRIPTION_URL: \$\{\{ secrets\.CLASH_SUBSCRIPTION_URL \}\}/);
   assert.match(yaml, /BBGU_PROXY_FILTER: \$\{\{ secrets\.BBGU_PROXY_FILTER \}\}/);
   assert.match(yaml, /BBGU_PROXY_EXCLUDE: \$\{\{ secrets\.BBGU_PROXY_EXCLUDE \}\}/);
-  assert.match(yaml, /docker\.io\/metacubex\/mihomo:Alpha/);
+  assert.match(yaml, /mihomo_image="docker\.io\/metacubex\/mihomo@sha256:28ce3e89d0c9068cbd99a61d2c596db2d239b01f07135ac8b6ad81bcba307984"/);
+  assert.match(yaml, /docker pull "\$mihomo_image"/);
+  assert.doesNotMatch(yaml, /metacubex\/mihomo:Alpha/);
   assert.match(yaml, /proxy-providers:/);
   assert.match(yaml, /external-controller: 127\.0\.0\.1:9090/);
   assert.match(yaml, /name: BBGU-STICKY/);

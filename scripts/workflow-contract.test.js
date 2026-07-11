@@ -76,6 +76,16 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.doesNotMatch(yaml, /等待可用的HK\/TW\/JP节点/);
   assert.match(yaml, /proxy_noise_exclude="\(\?i\)\(剩余\|流量\|到期\|官网\|套餐\)"/);
   assert.match(yaml, /echo "\[BBGU\] 等待Mihomo控制接口（\$attempt\/12）\.\.\."/);
+  assert.match(yaml, /mihomo_provider="\$mihomo_controller\/providers\/proxies\/airport"/);
+  assert.match(yaml, /for attempt in \{1\.\.6\}/);
+  assert.match(yaml, /等待机场订阅节点加载（\$attempt\/6）/);
+  assert.match(yaml, /Array\.isArray\(data\.proxies\)/);
+  assert.match(yaml, /data\.proxies\.map\(\(proxy\) => proxy\.name\)/);
+  assert.match(yaml, /specialNames = new Set\(\["COMPATIBLE", "DIRECT", "REJECT", "PASS", "GLOBAL", "BBGU-STICKY"\]\)/);
+  assert.doesNotMatch(yaml, /data\.all \|\| \[\]/);
+  assert.match(yaml, /上次粘性节点已不在当前国内节点列表/);
+  assert.match(yaml, /上次粘性节点网络不可用/);
+  assert.match(yaml, /机场订阅没有返回符合过滤条件的真实节点/);
   assert.match(yaml, /echo "\[BBGU\] 测试候选节点：\$candidate"/);
   assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);

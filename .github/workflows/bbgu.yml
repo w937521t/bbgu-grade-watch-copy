@@ -76,6 +76,7 @@ jobs:
           mihomo_dir="$RUNNER_TEMP/bbgu-mihomo"
           mkdir -p "$mihomo_dir/providers"
           mihomo_controller="http://127.0.0.1:9090"
+          mihomo_provider="$mihomo_controller/providers/proxies/airport"
           proxy_group="BBGU-STICKY"
           proxy_state_path="$BBGU_DATA_DIR/bbgu_proxy_state.json"
           subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
@@ -132,6 +133,22 @@ jobs:
             sleep 5
           done
 
+          candidates=""
+          for attempt in {1..6}; do
+            if provider_json="$(curl -fsS "$mihomo_provider" 2>/dev/null)"; then
+              candidates="$(printf '%s' "$provider_json" | node -e 'let text = ""; process.stdin.on("data", (chunk) => { text += chunk; }); process.stdin.on("end", () => { const data = JSON.parse(text); const specialNames = new Set(["COMPATIBLE", "DIRECT", "REJECT", "PASS", "GLOBAL", "BBGU-STICKY"]); const names = Array.isArray(data.proxies) ? data.proxies.map((proxy) => proxy.name) : []; for (const name of names) if (typeof name === "string" && name && !specialNames.has(name)) console.log(name); });')"
+            fi
+            if [[ -n "$candidates" ]]; then
+              break
+            fi
+            if [[ "$attempt" == "6" ]]; then
+              echo '[BBGU] 机场订阅没有返回符合过滤条件的真实节点。' >&2
+              exit 1
+            fi
+            echo "[BBGU] 等待机场订阅节点加载（$attempt/6）..."
+            sleep 5
+          done
+
           set_group_proxy() {
             local name="$1"
             local body
@@ -163,17 +180,15 @@ jobs:
 
           if [[ -n "$saved_proxy" ]]; then
             echo "[BBGU] 沿用上次可用节点：$saved_proxy"
-            if set_group_proxy "$saved_proxy" && result="$(test_bbgu_proxy 2>/dev/null)"; then
-              echo "[BBGU] Mihomo粘性节点可用：$saved_proxy $result"
-              exit 0
+            if grep -Fxq "$saved_proxy" <<< "$candidates"; then
+              if set_group_proxy "$saved_proxy" && result="$(test_bbgu_proxy 2>/dev/null)"; then
+                echo "[BBGU] Mihomo粘性节点可用：$saved_proxy $result"
+                exit 0
+              fi
+              echo "[BBGU] 上次粘性节点网络不可用，准备切换国内候选节点：$saved_proxy"
+            else
+              echo "[BBGU] 上次粘性节点已不在当前国内节点列表，准备切换：$saved_proxy"
             fi
-            echo "[BBGU] 上次粘性节点不可用，准备切换国内候选节点：$saved_proxy"
-          fi
-
-          candidates="$(curl -fsS "$mihomo_controller/proxies/$proxy_group" | node -e 'let text = ""; process.stdin.on("data", (chunk) => { text += chunk; }); process.stdin.on("end", () => { const data = JSON.parse(text); for (const name of data.all || []) console.log(name); });')"
-          if [[ -z "$candidates" ]]; then
-            echo '[BBGU] Mihomo没有返回候选节点。' >&2
-            exit 1
           fi
 
           while IFS= read -r candidate; do

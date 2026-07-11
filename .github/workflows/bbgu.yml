@@ -29,6 +29,8 @@ jobs:
     env:
       BBGU_DATA_DIR: ${{ github.workspace }}/bbgu-data
       BBGU_LOGIN_WAIT_SECONDS: '300'
+      BBGU_MIHOMO_CONTROLLER: http://127.0.0.1:9090
+      BBGU_MIHOMO_PROXY_GROUP: BBGU-STICKY
     steps:
       - name: 检出程序
         uses: actions/checkout@v4
@@ -94,6 +96,7 @@ jobs:
           mihomo_provider="$mihomo_controller/providers/proxies/airport"
           proxy_group="BBGU-STICKY"
           proxy_state_path="$BBGU_DATA_DIR/bbgu_proxy_state.json"
+          proxy_candidates_path="$BBGU_DATA_DIR/bbgu_proxy_candidates.json"
           subscription_json="$(node -e 'process.stdout.write(JSON.stringify(process.env.CLASH_SUBSCRIPTION_URL))')"
           proxy_filter="${BBGU_PROXY_FILTER:-(?i)(^CN-|中国|国内|上海|深圳|浙江|内蒙古|云南|山东|河南|成都|广东)}"
           proxy_user_exclude="${BBGU_PROXY_EXCLUDE:-(?i)(HK|香港|TW|台湾|JP|日本|US|美国|Netflix)}"
@@ -179,32 +182,10 @@ jobs:
             return 1
           }
 
-          test_bbgu_proxy() {
-            local endpoint
-            local http_code
-            local endpoints=(
-              'https://zhjw.bbgu.edu.cn/workspace/home'
-              'https://zhjw.bbgu.edu.cn/api/sam/score/student/score'
-              'https://authserver.bbgu.edu.cn/'
-              'https://open.weixin.qq.com/'
-            )
-
-            for endpoint in "${endpoints[@]}"; do
-              if ! http_code="$(curl --proxy http://127.0.0.1:7890 \
-                -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145 Safari/537.36' \
-                --connect-timeout 5 --max-time 10 -o /dev/null -sS \
-                -w '%{http_code}' "$endpoint")"; then
-                echo "[BBGU] 必要端点网络不可用：$endpoint" >&2
-                return 1
-              fi
-              echo "[BBGU] 必要端点可达：$endpoint HTTP=$http_code"
-            done
-          }
-
           save_sticky_proxy() {
             local name="$1"
             mkdir -p "$BBGU_DATA_DIR"
-            node -e 'const fs = require("fs"); fs.writeFileSync(process.argv[1], `${JSON.stringify({ selectedProxy: process.argv[2], updatedAt: new Date().toISOString() }, null, 2)}\n`);' "$proxy_state_path" "$name"
+            node -e 'const { saveSelectedProxy } = require("./bbgu_grade_watch"); saveSelectedProxy({ proxyStatePath: process.argv[1] }, process.argv[2]).catch((error) => { console.error(error); process.exitCode = 1; });' "$proxy_state_path" "$name"
             echo "[BBGU] 保存粘性节点：$name"
           }
 
@@ -212,6 +193,10 @@ jobs:
           if [[ -f "$proxy_state_path" ]]; then
             saved_proxy="$(node -e 'try { const state = require(process.argv[1]); process.stdout.write(String(state.selectedProxy || "")); } catch {}' "$proxy_state_path")"
           fi
+
+          printf '%s\n' "$candidates" | node -e 'const { writeFileAtomic } = require("./bbgu_grade_watch"); let text = ""; process.stdin.on("data", (chunk) => { text += chunk; }); process.stdin.on("end", async () => { const candidates = text.split(/\r?\n/).map((name) => name.trim()).filter(Boolean); await writeFileAtomic(process.argv[1], `${JSON.stringify({ candidates }, null, 2)}\n`); });' "$proxy_candidates_path"
+
+          startup_proxy="$(printf '%s\n' "$candidates" | node -e 'const fs = require("fs"); const { selectStartupProxy } = require("./bbgu_grade_watch"); let text = ""; process.stdin.on("data", (chunk) => { text += chunk; }); process.stdin.on("end", () => { let state = {}; try { state = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {} const candidates = text.split(/\r?\n/).map((name) => name.trim()).filter(Boolean); process.stdout.write(selectStartupProxy(state, candidates)); });' "$proxy_state_path")"
 
           if [[ "${BBGU_RUN_MODE:-}" == 'subscore-test' ]]; then
             if [[ -z "$saved_proxy" ]]; then
@@ -222,6 +207,10 @@ jobs:
               echo "[BBGU] 已保存的粘性节点不在当前候选列表，本次不切换节点：$saved_proxy" >&2
               exit 1
             fi
+            if [[ "$startup_proxy" != "$saved_proxy" ]]; then
+              echo "[BBGU] 已保存的粘性节点仍在失败冷却期，本次诊断不切换节点：$saved_proxy" >&2
+              exit 1
+            fi
             if ! set_group_proxy "$saved_proxy"; then
               exit 1
             fi
@@ -229,38 +218,25 @@ jobs:
             exit 0
           fi
 
-          if [[ -n "$saved_proxy" ]]; then
-            echo "[BBGU] 沿用上次可用节点：$saved_proxy"
-            if grep -Fxq "$saved_proxy" <<< "$candidates"; then
-              if ! set_group_proxy "$saved_proxy"; then
-                exit 1
-              fi
-              if result="$(test_bbgu_proxy)"; then
-                echo "[BBGU] Mihomo粘性节点可用：$saved_proxy $result"
-                exit 0
-              fi
-              echo "[BBGU] 上次粘性节点网络不可用，准备切换国内候选节点：$saved_proxy"
-            else
-              echo "[BBGU] 上次粘性节点已不在当前国内节点列表，准备切换：$saved_proxy"
-            fi
+          if [[ -z "$startup_proxy" ]]; then
+            echo '[BBGU] 所有国内候选节点仍在失败冷却期，本次不访问学校。' >&2
+            exit 1
           fi
 
-          while IFS= read -r candidate; do
-            [[ -z "$candidate" ]] && continue
-            [[ "$candidate" == "$saved_proxy" ]] && continue
-            echo "[BBGU] 测试候选节点：$candidate"
-            if ! set_group_proxy "$candidate"; then
-              exit 1
-            fi
-            if result="$(test_bbgu_proxy)"; then
-              save_sticky_proxy "$candidate"
-              echo "[BBGU] Mihomo代理可用：$candidate $result"
-              exit 0
-            fi
-          done <<< "$candidates"
+          if [[ -n "$saved_proxy" && "$startup_proxy" == "$saved_proxy" ]]; then
+            echo "[BBGU] 沿用上次可用节点：$saved_proxy"
+          elif [[ -n "$saved_proxy" ]]; then
+            echo "[BBGU] 上次粘性节点已不在当前国内节点列表或仍在失败冷却期，选择下一候选：$startup_proxy"
+          else
+            echo "[BBGU] 首次选择国内候选节点：$startup_proxy"
+          fi
 
-          echo '[BBGU] 所有候选代理节点均无法访问教务系统。' >&2
-          exit 1
+          if ! set_group_proxy "$startup_proxy"; then
+            echo '[BBGU] 无法选择启动候选节点。' >&2
+            exit 1
+          fi
+          save_sticky_proxy "$startup_proxy"
+          echo "[BBGU] 已选择启动节点，不向学校发送预检请求：$startup_proxy"
 
       - name: 执行BBGU任务
         id: run_bbgu
@@ -316,8 +292,10 @@ jobs:
             bbgu_token.env
             bbgu_storage_state.json
             bbgu_grade_snapshot.json
+            bbgu_pending_notification.json
             bbgu_qr_reminder_state.json
             bbgu_proxy_state.json
+            bbgu_network_state.json
           )
           files=()
           for name in "${names[@]}"; do

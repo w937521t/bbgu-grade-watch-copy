@@ -17,6 +17,7 @@ test('Workflow保持GitHub定时并使用加密状态分支', () => {
   assert.match(yaml, /BBGU_STATE_PASSWORD: \$\{\{ secrets\.BBGU_STATE_PASSWORD \}\}/);
   assert.match(yaml, /bbgu-state\.enc/);
   assert.match(yaml, /bbgu_proxy_state\.json/);
+  assert.match(yaml, /bbgu_pending_notification\.json/);
   assert.match(yaml, /git ls-remote --heads origin refs\/heads\/state/);
   assert.doesNotMatch(yaml, /git fetch origin ['"]\+refs\/heads\/state:refs\/remotes\/origin\/state['"] \|\| true/);
   assert.match(yaml, /node bbgu_grade_watch\.js renew/);
@@ -131,10 +132,13 @@ test('Workflow通过Mihomo代理访问教务系统', () => {
   assert.match(yaml, /specialNames = new Set\(\["COMPATIBLE", "DIRECT", "REJECT", "PASS", "GLOBAL", "BBGU-STICKY"\]\)/);
   assert.doesNotMatch(yaml, /data\.all \|\| \[\]/);
   assert.match(yaml, /上次粘性节点已不在当前国内节点列表/);
-  assert.match(yaml, /上次粘性节点网络不可用/);
   assert.match(yaml, /机场订阅没有返回符合过滤条件的真实节点/);
-  assert.match(yaml, /echo "\[BBGU\] 测试候选节点：\$candidate"/);
-  assert.match(yaml, /--proxy http:\/\/127\.0\.0\.1:7890/);
+  assert.match(yaml, /bbgu_proxy_candidates\.json/);
+  assert.match(yaml, /selectStartupProxy/);
+  assert.match(yaml, /saveSelectedProxy/);
+  assert.match(yaml, /writeFileAtomic/);
+  assert.match(yaml, /不向学校发送预检请求/);
+  assert.doesNotMatch(yaml, /test_bbgu_proxy\(\)/);
   assert.match(yaml, /NODE_USE_ENV_PROXY: ['"]1['"]/);
   assert.match(yaml, /BBGU_PROXY_SERVER: http:\/\/127\.0\.0\.1:7890/);
   assert.match(yaml, /NO_PROXY: .*pushplus/);
@@ -151,25 +155,18 @@ test('Workflow在启动Mihomo前恢复状态以沿用上次粘性节点', () => 
   assert.ok(restoreIndex < mihomoIndex);
 });
 
-test('Workflow通过四个必要端点验证代理并在主任务失败时输出Mihomo日志', () => {
+test('Workflow不预检学校端点并在主任务失败时输出Mihomo日志', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
   const setProxyFunction = yaml.match(/set_group_proxy\(\) \{[\s\S]*?\n          \}/)?.[0] || '';
-  const probeFunction = yaml.match(/test_bbgu_proxy\(\) \{[\s\S]*?\n          \}/)?.[0] || '';
-  const selectionBlock = yaml.match(/if \[\[ -n "\$saved_proxy" \]\]; then[\s\S]*?done <<< "\$candidates"/)?.[0] || '';
 
   assert.match(setProxyFunction, /for attempt in \{1\.\.3\}/);
   assert.match(setProxyFunction, /return 1/);
-  assert.match(probeFunction, /https:\/\/zhjw\.bbgu\.edu\.cn\/workspace\/home/);
-  assert.match(probeFunction, /https:\/\/zhjw\.bbgu\.edu\.cn\/api\/sam\/score\/student\/score/);
-  assert.match(probeFunction, /https:\/\/authserver\.bbgu\.edu\.cn\//);
-  assert.match(probeFunction, /https:\/\/open\.weixin\.qq\.com\//);
-  assert.match(probeFunction, /-A ['"]Mozilla\/5\.0/);
-  assert.doesNotMatch(probeFunction, /curl[^\n]*\s-f(?:\s|$)/);
-  assert.match(probeFunction, /return 1/);
-  assert.doesNotMatch(selectionBlock, /set_group_proxy "\$(?:saved_proxy|candidate)" &&/);
-  assert.match(selectionBlock, /if ! set_group_proxy "\$saved_proxy"; then[\s\S]*?exit 1[\s\S]*?if result="\$\(test_bbgu_proxy\)"; then/);
-  assert.match(selectionBlock, /if ! set_group_proxy "\$candidate"; then[\s\S]*?exit 1[\s\S]*?if result="\$\(test_bbgu_proxy\)"; then/);
-  assert.doesNotMatch(selectionBlock, /test_bbgu_proxy 2>\/dev\/null/);
+  assert.doesNotMatch(yaml, /https:\/\/zhjw\.bbgu\.edu\.cn\/workspace\/home/);
+  assert.doesNotMatch(yaml, /https:\/\/zhjw\.bbgu\.edu\.cn\/api\/sam\/score\/student\/score/);
+  assert.doesNotMatch(yaml, /https:\/\/authserver\.bbgu\.edu\.cn\//);
+  assert.doesNotMatch(yaml, /https:\/\/open\.weixin\.qq\.com\//);
+  assert.match(yaml, /BBGU_MIHOMO_CONTROLLER: http:\/\/127\.0\.0\.1:9090/);
+  assert.match(yaml, /BBGU_MIHOMO_PROXY_GROUP: BBGU-STICKY/);
   assert.match(yaml, /name: Mihomo诊断日志/);
   assert.match(yaml, /if: steps\.run_bbgu\.outcome == 'failure'/);
   assert.match(yaml, /docker logs --tail 100 bbgu-mihomo/);

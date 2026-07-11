@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
+const fsSync = require('node:fs');
 
 const bbguGradeWatch = require('./bbgu_grade_watch');
 const {
@@ -15,6 +16,7 @@ const {
   mergePersistedSubScores,
   selectRowsForSubScoreFetch,
   enrichRowsWithSubScores,
+  fetchBbguSubScores,
   diagnoseBbguSubscore,
   runSubscoreDiagnostic,
   requestJsonTextWithHttpsProxy,
@@ -23,6 +25,7 @@ const {
   parseBooleanEnv,
   parsePositiveIntegerEnv,
   normalizeBbguScoreApiData,
+  fetchBbguScoreRows,
   calculateTermArithmeticAverage,
   buildAuthorizationHeader,
   decodeJwtPayload,
@@ -37,6 +40,8 @@ const {
   extractAuthStateFromStorageState,
   readSavedAuthState,
   saveAuthState,
+  writeFileAtomic,
+  saveBrowserStorageState,
   readQrReminderState,
   saveQrReminderSchedule,
   markCasExpired,
@@ -59,15 +64,43 @@ const {
   getConfig,
   isLikelyQrLoginUrl,
   extractWeixinQrInfoFromHtml,
-  extractWeixinQrConnectUrlFromHtml,
   recoverDirectApiAfterAuthExpired,
   maybeRunScheduledQr,
   requestJsonText,
+  isNetworkTransportError,
+  isSafeCasFailoverError,
+  isSafeApiFailoverError,
+  selectStartupProxy,
+  withSingleProxyFailover,
+  markWatchNetworkFailure,
+  markSchoolBackoff,
+  consumeWatchNetworkCooldown,
   run,
   runRenew,
   clearBrowserAccessTokens,
+  sanitizeStorageStateForAccessRenewal,
+  performSilentRenew,
+  processGradeRows,
   navigateToLoginPage,
+  waitForAuthenticationAfterQr,
+  waitForAuthState,
+  collectLoginQrArtifacts,
+  shouldStartQrLogin,
+  finalizeLoginReminderState,
+  validateBrowserHttpResponse,
+  handleChromeErrorPage,
+  readRefreshResponse,
 } = bbguGradeWatch;
+
+test('GitHub Workflow不预检学校端点并向脚本保存候选节点', () => {
+  const workflow = fsSync.readFileSync(path.join(__dirname, '.github', 'workflows', 'bbgu.yml'), 'utf8');
+  assert.doesNotMatch(workflow, /test_bbgu_proxy\s*\(\)/);
+  assert.doesNotMatch(workflow, /api\/sam\/score\/student\/score/);
+  assert.doesNotMatch(workflow, /open\.weixin\.qq\.com/);
+  assert.match(workflow, /bbgu_proxy_candidates\.json/);
+  assert.match(workflow, /BBGU_MIHOMO_CONTROLLER/);
+  assert.match(workflow, /BBGU_MIHOMO_PROXY_GROUP/);
+});
 
 function makeJwt(payload) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -593,6 +626,201 @@ test('requestJsonText限制首选fetch请求时间', async () => {
   }
 });
 
+test('同一任务仅从粘性节点A切换一个候选B且成功后保存B', async () => {
+  const calls = [];
+  let attempts = 0;
+  const result = await withSingleProxyFailover({ proxyServer: 'http://127.0.0.1:7890' }, async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('target-tls: TLS handshake failed');
+      error.code = 'EPROTO';
+      error.stage = 'target-tls';
+      throw error;
+    }
+    return 'ok';
+  }, {
+    readProxyRuntimeFn: async () => ({ current: 'CN-A', candidates: ['CN-A', 'CN-B', 'CN-C'] }),
+    selectProxyFn: async (name) => calls.push(`select:${name}`),
+    saveProxyFn: async (name) => calls.push(`save:${name}`),
+  });
+
+  assert.equal(result, 'ok');
+  assert.equal(attempts, 2);
+  assert.deepEqual(calls, ['select:CN-B', 'save:CN-B']);
+});
+
+test('候选节点B也网络失败时不遍历C并记录A和B失败', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-proxy-failures-'));
+  const calls = [];
+  let attempts = 0;
+  const config = {
+    proxyServer: 'http://127.0.0.1:7890',
+    proxyStatePath: path.join(tempDir, 'proxy-state.json'),
+    proxyCandidatesPath: path.join(tempDir, 'proxy-candidates.json'),
+  };
+  try {
+    await fs.writeFile(config.proxyStatePath, JSON.stringify({ selectedProxy: 'CN-A' }), 'utf8');
+    await fs.writeFile(config.proxyCandidatesPath, JSON.stringify({ candidates: ['CN-A', 'CN-B', 'CN-C'] }), 'utf8');
+    await assert.rejects(withSingleProxyFailover(config, async () => {
+      attempts += 1;
+      const error = new Error('target-tls: TLS handshake failed');
+      error.code = 'EPROTO';
+      error.stage = 'target-tls';
+      throw error;
+    }, {
+      selectProxyFn: async (name) => calls.push(`select:${name}`),
+      nowFn: () => 1000,
+    }), (error) => error && error.code === 'BBGU_PROXY_FAILOVER_EXHAUSTED');
+
+    const state = JSON.parse(await fs.readFile(config.proxyStatePath, 'utf8'));
+    assert.equal(state.failedNodes['CN-A'], 1000 + 6 * 60 * 60 * 1000);
+    assert.equal(state.failedNodes['CN-B'], 1000 + 6 * 60 * 60 * 1000);
+    assert.equal(selectStartupProxy(state, ['CN-A', 'CN-B', 'CN-C'], 2000), 'CN-C');
+    assert.equal(attempts, 2);
+    assert.deepEqual(calls, ['select:CN-B']);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('整个任务只允许使用一次节点切换额度', async () => {
+  const config = { proxyServer: 'http://127.0.0.1:7890' };
+  const calls = [];
+  let firstAttempts = 0;
+  await withSingleProxyFailover(config, async () => {
+    firstAttempts += 1;
+    if (firstAttempts === 1) throw Object.assign(new Error('target-tls: TLS handshake failed'), { code: 'EPROTO', stage: 'target-tls' });
+    return 'ok';
+  }, {
+    readProxyRuntimeFn: async () => ({ current: 'CN-A', candidates: ['CN-A', 'CN-B'] }),
+    selectProxyFn: async (name) => calls.push(`select:${name}`),
+    saveProxyFn: async (name) => calls.push(`save:${name}`),
+  });
+
+  let secondAttempts = 0;
+  await assert.rejects(withSingleProxyFailover(config, async () => {
+    secondAttempts += 1;
+    throw Object.assign(new Error('target-tls: TLS handshake failed'), { code: 'EPROTO', stage: 'target-tls' });
+  }, {
+    readProxyRuntimeFn: async () => ({ current: 'CN-B', candidates: ['CN-A', 'CN-B'] }),
+    selectProxyFn: async (name) => calls.push(`select:${name}`),
+    saveProxyFn: async (name) => calls.push(`save:${name}`),
+  }), (error) => error && error.code === 'BBGU_PROXY_FAILOVER_EXHAUSTED');
+
+  assert.equal(secondAttempts, 1);
+  assert.deepEqual(calls, ['select:CN-B', 'save:CN-B']);
+});
+
+test('HTTP业务错误不触发节点切换', async () => {
+  let selected = 0;
+  const error = new Error('HTTP 503');
+  error.httpStatus = 503;
+  await assert.rejects(withSingleProxyFailover({ proxyServer: 'http://127.0.0.1:7890' }, async () => {
+    throw error;
+  }, {
+    readProxyRuntimeFn: async () => ({ current: 'CN-A', candidates: ['CN-A', 'CN-B'] }),
+    selectProxyFn: async () => { selected += 1; },
+  }), (caught) => caught === error);
+  assert.equal(selected, 0);
+  assert.equal(isNetworkTransportError(error), false);
+});
+
+test('CAS只在请求确定未到后端的建连错误时切换节点', () => {
+  assert.equal(isSafeCasFailoverError(Object.assign(new Error('net::ERR_PROXY_CONNECTION_FAILED'), { code: 'ERR_PROXY_CONNECTION_FAILED' })), true);
+  assert.equal(isSafeCasFailoverError(Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' })), true);
+  assert.equal(isSafeCasFailoverError(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })), false);
+  assert.equal(isSafeCasFailoverError(Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })), false);
+});
+
+test('成绩请求只在到达学校前的网络阶段切换节点', () => {
+  assert.equal(isSafeApiFailoverError(Object.assign(new Error('proxy unavailable'), { stage: 'proxy-tcp', code: 'ECONNREFUSED' })), true);
+  assert.equal(isSafeApiFailoverError(Object.assign(new Error('CONNECT failed'), { stage: 'connect', code: 'ECONNRESET' })), true);
+  assert.equal(isSafeApiFailoverError(Object.assign(new Error('TLS failed'), { stage: 'target-tls', code: 'EPROTO' })), true);
+  assert.equal(isSafeApiFailoverError(Object.assign(new Error('request reset'), { stage: 'request', code: 'ECONNRESET' })), false);
+  assert.equal(isSafeApiFailoverError(Object.assign(new Error('body aborted'), { stage: 'response-body', code: 'ERR_HTTP_RESPONSE_ABORTED' })), false);
+  assert.equal(isNetworkTransportError(Object.assign(new Error('response aborted'), { stage: 'response-body', code: 'ERR_HTTP_RESPONSE_ABORTED' })), true);
+  assert.equal(isNetworkTransportError(Object.assign(new Error('response incomplete'), { stage: 'response-body', code: 'ERR_HTTP_RESPONSE_INCOMPLETE' })), true);
+  assert.equal(isNetworkTransportError(new Error('Proxy refresh CONNECT timeout after 15000ms')), true);
+  assert.equal(isNetworkTransportError(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })), true);
+});
+
+test('Watch双节点失败后仅跳过下一次Watch', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-watch-network-'));
+  const config = { networkStatePath: path.join(tempDir, 'network.json') };
+  try {
+    await markWatchNetworkFailure(config, 1000);
+    assert.equal(await consumeWatchNetworkCooldown(config), true);
+    assert.equal(await consumeWatchNetworkCooldown(config), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('学校429按Retry-After退避且到期后恢复Watch', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-school-backoff-'));
+  const config = { networkStatePath: path.join(tempDir, 'network.json') };
+  const error = Object.assign(new Error('HTTP 429'), { httpStatus: 429, retryAfter: '7200' });
+  try {
+    await markSchoolBackoff(config, error, 1000);
+    assert.equal(await consumeWatchNetworkCooldown(config, 1000 + 60 * 60 * 1000), true);
+    assert.equal(await consumeWatchNetworkCooldown(config, 1000 + 2 * 60 * 60 * 1000 + 1), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('学校5xx只跳过下一次Watch且不触发节点切换', async () => {
+  const calls = [];
+  const error = Object.assign(new Error('BBGU score API failed HTTP 503'), { httpStatus: 503 });
+  await assert.rejects(run({
+    pushplusToken: 'push-token',
+    term: '2026春',
+    authorization: `Bearer ${makeJwt({ exp: 4102444800 })}`,
+  }, {
+    fetchScoreRowsFn: async () => { calls.push('fetch'); throw error; },
+    markSchoolBackoffFn: async (_config, caught) => calls.push(`backoff:${caught.httpStatus}`),
+    markWatchNetworkFailureFn: async () => calls.push('network-backoff'),
+  }), (caught) => caught === error);
+  assert.deepEqual(calls, ['fetch', 'backoff:503']);
+});
+
+test('成绩接口错误保留HTTP状态和Retry-After', async () => {
+  await assert.rejects(fetchBbguScoreRows({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: 'Bearer saved.access',
+    proxyServer: 'http://127.0.0.1:7890',
+    term: '2026春',
+  }, {
+    withProxyFailoverFn: async (_config, operation) => operation(),
+    proxyHttpsRequestFn: async () => ({
+      status: 429,
+      text: JSON.stringify({ status: 'fail', ok: false, msg: 'too many requests' }),
+      headers: { 'retry-after': '3600' },
+    }),
+  }), (error) => error && error.httpStatus === 429 && error.retryAfter === '3600');
+});
+
+test('请求已发出后的网络失败不跨IP重试但仍安排Watch冷却', async () => {
+  const calls = [];
+  const config = {
+    pushplusToken: 'push-token',
+    term: '2026春',
+    authorization: `Bearer ${makeJwt({ exp: 4102444800 })}`,
+  };
+  await assert.rejects(run(config, {
+    fetchScoreRowsFn: async () => {
+      calls.push('fetch');
+      const error = Object.assign(new Error('response-body aborted'), {
+        code: 'BBGU_PROXY_NETWORK_FAILED',
+        stage: 'response-body',
+      });
+      throw error;
+    },
+    markWatchNetworkFailureFn: async () => calls.push('cooldown'),
+  }), /response-body aborted/);
+  assert.deepEqual(calls, ['fetch', 'cooldown']);
+});
+
 test('calculateTermArithmeticAverage only uses numeric scores from selected term', () => {
   assert.deepEqual(calculateTermArithmeticAverage([
     { courseName: 'A', score: '99', term: '2026春' },
@@ -686,6 +914,103 @@ test('normalizeSubScoreList extracts score form subscore rows', () => {
     { name: '平时成绩', weight: '30', score: '80' },
     { name: '期末成绩', weight: '70', score: '50' },
   ]);
+});
+
+test('普通Watch的平时分在代理模式下直接使用原生HTTPS且只请求一次', async () => {
+  const originalFetch = global.fetch;
+  const originalGithubActions = process.env.GITHUB_ACTIONS;
+  const proxyCalls = [];
+  let genericCalls = 0;
+  global.fetch = async () => {
+    throw Object.assign(new TypeError('legacy fetch path must not run'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+  };
+  process.env.GITHUB_ACTIONS = 'true';
+
+  try {
+    const subScores = await fetchBbguSubScores('score-watch', {
+      homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+      authorization: 'Bearer saved.access',
+      proxyServer: 'http://127.0.0.1:7890',
+    }, {
+      requestJsonTextFn: async () => {
+        genericCalls += 1;
+        throw new Error('generic request path must not run');
+      },
+      proxyHttpsRequestFn: async (url, headers, proxyServer) => {
+        proxyCalls.push({ url, headers, proxyServer });
+        return {
+          status: 200,
+          text: JSON.stringify({
+            status: 'success',
+            data: { subScoreList: [{ scoreName: '平时成绩', weight: 15, score: 85 }] },
+          }),
+          via: 'proxy-https',
+        };
+      },
+    });
+
+    assert.deepEqual(subScores, [{ name: '平时成绩', weight: '15', score: '85' }]);
+    assert.equal(genericCalls, 0);
+    assert.equal(proxyCalls.length, 1);
+    assert.equal(proxyCalls[0].url, 'https://zhjw.bbgu.edu.cn/api/sam/scoreManage/stu-score-form?scoreId=score-watch');
+    assert.equal(proxyCalls[0].proxyServer, 'http://127.0.0.1:7890');
+    assert.equal(proxyCalls[0].headers.authorization, 'Bearer saved.access');
+  } finally {
+    global.fetch = originalFetch;
+    if (originalGithubActions === undefined) {
+      delete process.env.GITHUB_ACTIONS;
+    } else {
+      process.env.GITHUB_ACTIONS = originalGithubActions;
+    }
+  }
+});
+
+test('普通Watch的成绩接口在代理模式下直接使用原生HTTPS且只请求一次', async () => {
+  const proxyCalls = [];
+  let genericCalls = 0;
+
+  const rows = await fetchBbguScoreRows({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: 'Bearer saved.access',
+    proxyServer: 'http://127.0.0.1:7890',
+    term: '2026春',
+  }, {
+    requestJsonTextFn: async () => {
+      genericCalls += 1;
+      throw new Error('generic request path must not run');
+    },
+    proxyHttpsRequestFn: async (url, headers, proxyServer) => {
+      proxyCalls.push({ url, headers, proxyServer });
+      return {
+        status: 200,
+        text: JSON.stringify({
+          status: 'success',
+          ok: true,
+          data: {
+            '2026春': {
+              stuScoreHomePgVoS: [{
+                courseName: '测试课程',
+                courseCode: 'TEST001',
+                sessionName: '2026春',
+                scoreShow: '95',
+              }],
+            },
+          },
+        }),
+        via: 'proxy-https',
+      };
+    },
+  });
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].courseName, '测试课程');
+  assert.equal(genericCalls, 0);
+  assert.equal(proxyCalls.length, 1);
+  assert.equal(proxyCalls[0].url, 'https://zhjw.bbgu.edu.cn/api/sam/score/student/score');
+  assert.equal(proxyCalls[0].proxyServer, 'http://127.0.0.1:7890');
+  assert.equal(proxyCalls[0].headers.authorization, 'Bearer saved.access');
 });
 
 test('平时分诊断在fetch连接重置后通过同一代理原生HTTPS重试', async () => {
@@ -927,6 +1252,117 @@ test('buildAuthorizationHeader accepts raw token and JSON-stringified token', ()
   assert.equal(buildAuthorizationHeader('"abc.def.ghi"'), 'Bearer abc.def.ghi');
 });
 
+test('PushPlus失败后保存快照和待推送内容且下次不重复查询平时分', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-pending-push-'));
+  const config = {
+    term: '2026春',
+    pushplusToken: 'push-token',
+    snapshotPath: path.join(tempDir, 'snapshot.json'),
+    pendingNotificationPath: path.join(tempDir, 'pending.json'),
+  };
+  const rows = [{
+    key: '2026春::TEST001::测试课程',
+    courseName: '测试课程',
+    scoreId: 'score-1',
+    score: '95',
+    credit: '1.0',
+    term: '2026春',
+  }];
+  let subscoreFetches = 0;
+  let pushAttempts = 0;
+
+  try {
+    await assert.rejects(processGradeRows(rows, config, {
+      enrichRowsWithSubScoresFn: async (diff) => {
+        subscoreFetches += 1;
+        diff.added[0].subScores = [{ name: '平时成绩', weight: '30', score: '90' }];
+      },
+      sendPushPlusFn: async () => {
+        pushAttempts += 1;
+        throw new Error('PushPlus unavailable');
+      },
+    }), /PushPlus unavailable/);
+
+    assert.equal(subscoreFetches, 1);
+    assert.equal(pushAttempts, 1);
+    assert.equal((await JSON.parse(await fs.readFile(config.snapshotPath, 'utf8'))).length, 1);
+    assert.equal((await JSON.parse(await fs.readFile(config.pendingNotificationPath, 'utf8'))).items.length, 1);
+
+    await processGradeRows(rows, config, {
+      enrichRowsWithSubScoresFn: async () => { subscoreFetches += 1; },
+      sendPushPlusFn: async () => { pushAttempts += 1; },
+    });
+
+    assert.equal(subscoreFetches, 1);
+    assert.equal(pushAttempts, 2);
+    await assert.rejects(fs.access(config.pendingNotificationPath), { code: 'ENOENT' });
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('快照首次写入失败后复用待推送内容且不重复查询平时分', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-pending-snapshot-'));
+  const config = {
+    term: '2026春',
+    pushplusToken: 'push-token',
+    snapshotPath: path.join(tempDir, 'snapshot.json'),
+    pendingNotificationPath: path.join(tempDir, 'pending.json'),
+  };
+  const rows = [{
+    key: '2026春::TEST001::测试课程',
+    courseName: '测试课程',
+    scoreId: 'score-1',
+    score: '95',
+    credit: '1.0',
+    term: '2026春',
+  }];
+  let subscoreFetches = 0;
+  let pushAttempts = 0;
+  let snapshotWrites = 0;
+
+  try {
+    await assert.rejects(processGradeRows(rows, config, {
+      enrichRowsWithSubScoresFn: async (diff) => {
+        subscoreFetches += 1;
+        diff.added[0].subScores = [{ name: '平时成绩', weight: '30', score: '90' }];
+      },
+      sendPushPlusFn: async () => { pushAttempts += 1; },
+      writeSnapshotFn: async () => {
+        snapshotWrites += 1;
+        throw new Error('snapshot write failed');
+      },
+    }), /snapshot write failed/);
+
+    assert.equal(subscoreFetches, 1);
+    assert.equal(pushAttempts, 0);
+    assert.equal((await JSON.parse(await fs.readFile(config.pendingNotificationPath, 'utf8'))).items.length, 1);
+
+    await processGradeRows(rows, config, {
+      enrichRowsWithSubScoresFn: async () => { subscoreFetches += 1; },
+      sendPushPlusFn: async () => { pushAttempts += 1; },
+      writeSnapshotFn: async (filePath, value) => {
+        snapshotWrites += 1;
+        await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      },
+    });
+
+    assert.equal(subscoreFetches, 1);
+    assert.equal(pushAttempts, 1);
+    assert.equal(snapshotWrites, 2);
+    assert.equal((await JSON.parse(await fs.readFile(config.snapshotPath, 'utf8'))).length, 1);
+    await assert.rejects(fs.access(config.pendingNotificationPath), { code: 'ENOENT' });
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('扫码流程不主动补请求combinedLogin或qrconnect', () => {
+  const source = fsSync.readFileSync(path.join(__dirname, 'bbgu_grade_watch.js'), 'utf8');
+  assert.doesNotMatch(source, /weixinQrCapture\.wait\(5000\)\s*\|\|\s*await fetchWeixinQrInfoFromPage/);
+  assert.doesNotMatch(source, /async function fetchWeixinQrInfoFromPage/);
+});
+
 test('extractJwtExpiry decodes JWT exp claim', () => {
   const payload = Buffer.from(JSON.stringify({ exp: 1782914400 })).toString('base64url');
   const token = `header.${payload}.signature`;
@@ -942,6 +1378,219 @@ test('isAuthExpiredResponse detects expired token responses', () => {
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"fail"}', body: { status: 'fail', msg: 'token expired' } }), true);
   assert.equal(isAuthExpiredResponse({ httpStatus: 200, text: '{"status":"success"}', body: { status: 'success', ok: true } }), false);
   assert.equal(isAuthExpiredResponse({ httpStatus: 502, text: '{"ok":false,"msg":"bad gateway"}', body: { ok: false, msg: 'bad gateway' } }), false);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 403, text: '{"ok":false,"msg":"forbidden"}', body: { ok: false, msg: 'forbidden' } }), false);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 403, text: '<html>Please login through the campus network</html>', body: null }), false);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 429, text: '{"ok":false,"msg":"too many requests"}', body: { ok: false, msg: 'too many requests' } }), false);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 403, text: '{"ok":false,"msg":"token expired"}', body: { ok: false, msg: 'token expired' } }), true);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 302, text: '', body: null, headers: { location: 'https://authserver.bbgu.edu.cn/login' } }), true);
+  assert.equal(isAuthExpiredResponse({ httpStatus: 302, text: '', body: null, headers: { location: 'https://example.com/maintenance' } }), false);
+});
+
+test('成绩接口将明确指向CAS的重定向交给认证恢复', async () => {
+  await assert.rejects(fetchBbguScoreRows({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    authorization: 'Bearer saved.access',
+    proxyServer: 'http://127.0.0.1:7890',
+    term: '2026春',
+  }, {
+    withProxyFailoverFn: async (_config, operation) => operation(),
+    proxyHttpsRequestFn: async () => ({
+      status: 302,
+      text: '',
+      headers: { location: 'https://authserver.bbgu.edu.cn/login?service=sam' },
+    }),
+  }), (error) => error && error.code === 'BBGU_AUTH_EXPIRED');
+});
+
+test('原子写入失败时保留旧文件并清理临时文件', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-atomic-write-'));
+  const targetPath = path.join(tempDir, 'state.json');
+  try {
+    await fs.writeFile(targetPath, 'old', 'utf8');
+    await assert.rejects(writeFileAtomic(targetPath, 'new', {
+      writeFileFn: async (tempPath) => {
+        await fs.writeFile(tempPath, 'partial', 'utf8');
+        throw new Error('interrupted');
+      },
+    }), /interrupted/);
+    assert.equal(await fs.readFile(targetPath, 'utf8'), 'old');
+    assert.deepEqual(await fs.readdir(tempDir), ['state.json']);
+
+    await writeFileAtomic(targetPath, 'new');
+    assert.equal(await fs.readFile(targetPath, 'utf8'), 'new');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('浏览器状态写入失败时保留旧状态文件', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-atomic-browser-'));
+  const targetPath = path.join(tempDir, 'storage.json');
+  try {
+    await fs.writeFile(targetPath, '{"old":true}', 'utf8');
+    await assert.rejects(saveBrowserStorageState({
+      storageState: async ({ path: tempPath }) => {
+        await fs.writeFile(tempPath, '{"partial":', 'utf8');
+        throw new Error('browser state interrupted');
+      },
+    }, targetPath), /browser state interrupted/);
+    assert.equal(await fs.readFile(targetPath, 'utf8'), '{"old":true}');
+    assert.deepEqual(await fs.readdir(tempDir), ['storage.json']);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('扫码后Access已出现时不依赖页面文字继续等待', async () => {
+  let waits = 0;
+  const result = await waitForAuthenticationAfterQr({
+    waitForTimeout: async () => { waits += 1; },
+  }, { loginWaitSeconds: 300 }, {
+    extractAuthStateFn: async () => ({ accessToken: 'new.access', refreshToken: '' }),
+    isAuthenticatedFn: async () => false,
+    nowFn: (() => { let now = 0; return () => now += 5000; })(),
+  });
+  assert.equal(result, true);
+  assert.equal(waits, 0);
+});
+
+test('二维码已被捕获时不固定额外等待五秒', async () => {
+  let waits = 0;
+  let screenshots = 0;
+  const result = await collectLoginQrArtifacts({}, {}, {
+    get: () => ({ qrImageUrl: 'https://open.weixin.qq.com/connect/qrcode/test' }),
+    wait: async () => { waits += 1; return null; },
+  }, {
+    saveQrElementScreenshotFn: async () => { screenshots += 1; return 'qr.png'; },
+  });
+  assert.equal(waits, 0);
+  assert.equal(screenshots, 1);
+  assert.equal(result.qrElementScreenshotPath, 'qr.png');
+  assert.equal(result.weixinQrInfo.qrImageUrl, 'https://open.weixin.qq.com/connect/qrcode/test');
+});
+
+test('Access出现后只给Refresh一个短宽限期', async () => {
+  let now = 0;
+  let reads = 0;
+  const page = {
+    evaluate: async () => {
+      reads += 1;
+      return { accessToken: 'new.access', refreshToken: '' };
+    },
+    waitForTimeout: async (milliseconds) => { now += milliseconds; },
+  };
+  const result = await waitForAuthState(page, 30000, {
+    nowFn: () => now,
+    refreshGraceMs: 2000,
+  });
+  assert.deepEqual(result, { accessToken: 'new.access', refreshToken: '' });
+  assert.equal(reads, 2);
+  assert.equal(now, 2000);
+});
+
+test('自动登录接受导航后新生成的Access而不进入二维码流程', async () => {
+  const shouldStart = await shouldStartQrLogin({}, {
+    extractAuthStateFn: async () => ({ accessToken: 'new.access', refreshToken: '' }),
+    isAuthenticatedFn: async () => false,
+  });
+  assert.equal(shouldStart, false);
+});
+
+test('已确认失效的旧Refresh不会在登录后复活', async () => {
+  const saved = [];
+  const result = await saveBrowserAuthState({}, { tokenPath: 'token.env' }, {
+    waitForAuthStateFn: async () => ({ accessToken: 'new.access', refreshToken: '' }),
+    readSavedAuthStateFn: async () => ({ accessToken: 'old.access', refreshToken: 'dead.refresh' }),
+    readQrReminderStateFn: async () => ({ refreshExpired: true }),
+    saveAuthStateFn: async (_filePath, state) => saved.push(state),
+  });
+  assert.deepEqual(result, { accessToken: 'new.access', refreshToken: '' });
+  assert.deepEqual(saved, [{ accessToken: 'new.access', refreshToken: '' }]);
+});
+
+test('登录没有取得新Refresh时保留Refresh失效标记并清除旧二维码计划', async () => {
+  const writes = [];
+  await finalizeLoginReminderState({ qrReminderStatePath: 'qr.json' }, {
+    accessToken: 'new.access',
+    refreshToken: '',
+  }, {
+    clearQrReminderStateFn: async () => writes.push('clear'),
+    writeJsonFn: async (_filePath, state) => writes.push(state),
+  });
+  assert.deepEqual(writes, [{ refreshExpired: true }]);
+});
+
+test('chrome-error登录页记录当前节点网络失败并终止登录', async () => {
+  const calls = [];
+  await assert.rejects(handleChromeErrorPage({
+    url: () => 'chrome-error://chromewebdata/',
+  }, {}, {
+    recordCurrentProxyFailureFn: async (error) => calls.push(['proxy', error.code]),
+    saveLoginTimeoutDiagnosticsFn: async () => ({ reportPath: 'report.json', screenshotPath: 'screen.png' }),
+  }), (error) => {
+    assert.equal(error.code, 'BBGU_PROXY_NETWORK_FAILED');
+    assert.match(error.message, /report\.json/);
+    return true;
+  });
+  assert.deepEqual(calls, [['proxy', 'BBGU_PROXY_NETWORK_FAILED']]);
+});
+
+test('Refresh响应体被中断时报告response-body阶段且不返回半包', async () => {
+  const response = new EventEmitter();
+  response.statusCode = 200;
+  response.complete = false;
+  response.setEncoding = () => undefined;
+  const pending = readRefreshResponse(response);
+  response.emit('data', '{"access_token":"partial');
+  response.emit('aborted');
+  response.emit('close');
+  await assert.rejects(pending, (error) => (
+    error
+    && error.code === 'ERR_HTTP_RESPONSE_ABORTED'
+    && error.stage === 'response-body'
+  ));
+});
+
+test('Refresh响应end但消息不完整时仍拒绝半包', async () => {
+  const response = new EventEmitter();
+  response.statusCode = 200;
+  response.complete = false;
+  response.setEncoding = () => undefined;
+  const pending = readRefreshResponse(response);
+  response.emit('data', '{"access_token":"partial"}');
+  response.emit('end');
+  await assert.rejects(pending, (error) => (
+    error
+    && error.code === 'ERR_HTTP_RESPONSE_INCOMPLETE'
+    && error.stage === 'response-body'
+  ));
+});
+
+test('浏览器导航429保留Retry-After并在二维码处理前终止', async () => {
+  const response = {
+    status: () => 429,
+    headers: () => ({ 'retry-after': '900' }),
+    url: () => 'https://zhjw.bbgu.edu.cn/workspace/home',
+  };
+  await assert.rejects(validateBrowserHttpResponse(response), (error) => {
+    assert.equal(error.httpStatus, 429);
+    assert.equal(error.retryAfter, '900');
+    return true;
+  });
+});
+
+test('浏览器导航5xx终止且健康响应正常通过', async () => {
+  await assert.rejects(validateBrowserHttpResponse({
+    status: () => 503,
+    headers: () => ({}),
+    url: () => 'https://zhjw.bbgu.edu.cn/authserver/casLogin',
+  }), (error) => error && error.httpStatus === 503);
+  await assert.doesNotReject(validateBrowserHttpResponse({
+    status: () => 200,
+    headers: () => ({}),
+    url: () => 'https://zhjw.bbgu.edu.cn/workspace/home',
+  }));
+  await assert.doesNotReject(validateBrowserHttpResponse(null));
 });
 
 test('parseSavedAuthState reads access and refresh tokens and keeps legacy formats', () => {
@@ -1357,6 +2006,80 @@ test('已有二维码计划时普通查询遵守二维码冷却并跳过CAS', as
   assert.deepEqual(calls, ['scheduled-qr']);
 });
 
+test('CAS续期本地状态仅删除旧Access并保留Refresh与Cookie', () => {
+  const storage = {
+    cookies: [{ name: 'CASTGC', value: 'cas-cookie', domain: 'authserver.bbgu.edu.cn' }],
+    origins: [{
+      origin: 'https://zhjw.bbgu.edu.cn',
+      localStorage: [
+        { name: 'cqu_edu_ACCESS_TOKEN', value: 'old.access' },
+        { name: 'cqu_edu_CURRENT_TOKEN', value: 'old.current' },
+        { name: 'cqu_edu_REFRESH_TOKEN', value: 'saved.refresh' },
+        { name: 'unrelated', value: 'keep' },
+      ],
+    }],
+  };
+
+  const sanitized = sanitizeStorageStateForAccessRenewal(storage, 'https://zhjw.bbgu.edu.cn');
+  assert.deepEqual(sanitized.cookies, storage.cookies);
+  assert.deepEqual(sanitized.origins[0].localStorage, [
+    { name: 'cqu_edu_REFRESH_TOKEN', value: 'saved.refresh' },
+    { name: 'unrelated', value: 'keep' },
+  ]);
+  assert.equal(storage.origins[0].localStorage.length, 4);
+});
+
+test('CAS续期只导航一次续期地址并在Token出现后立即保存', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bbgu-cas-storage-'));
+  const calls = [];
+  const page = {
+    goto: async (url, options) => {
+      calls.push({ type: 'goto', url, options });
+      return {};
+    },
+    url: () => 'https://zhjw.bbgu.edu.cn/sam/cas',
+  };
+  let routeHandler;
+  const context = {
+    route: async (_pattern, handler) => { routeHandler = handler; },
+    newPage: async () => page,
+    storageState: async ({ path: outputPath }) => {
+      calls.push({ type: 'storage', path: outputPath });
+      await fs.writeFile(outputPath, '{}', 'utf8');
+    },
+  };
+  const config = {
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    tokenPath: path.join(tempDir, 'token.env'),
+    storageStatePath: path.join(tempDir, 'storage.json'),
+  };
+
+  const result = await performSilentRenew(context, config, {
+    withProxyFailoverFn: async (_config, operation, failoverOptions) => {
+      assert.equal(failoverOptions.shouldFailoverFn, isSafeCasFailoverError);
+      return operation();
+    },
+    saveBrowserAuthStateFn: async (actualPage, actualConfig) => {
+      assert.equal(actualPage, page);
+      assert.equal(actualConfig, config);
+      calls.push({ type: 'save-auth' });
+    },
+  });
+
+  assert.equal(result.status, 'renew_ok');
+  assert.deepEqual(calls.map((call) => call.type), ['goto', 'save-auth', 'storage']);
+  assert.equal(calls[0].url, buildCasRenewUrl(config));
+  assert.equal(typeof routeHandler, 'function');
+  const blocked = [];
+  await routeHandler({
+    request: () => ({ resourceType: () => 'font' }),
+    abort: async () => blocked.push('abort'),
+    continue: async () => blocked.push('continue'),
+  });
+  assert.deepEqual(blocked, ['abort']);
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
 test('普通查询已有Refresh失效记录时不再请求Refresh', async () => {
   const calls = [];
   const config = { tokenPath: 'token.env' };
@@ -1385,19 +2108,18 @@ test('普通查询已有Refresh失效记录时不再请求Refresh', async () => 
 
 test('run starts automatic login recovery when saved direct API token is expired', async () => {
   const calls = [];
+  const expiredToken = makeJwt({ exp: 1 });
   const config = {
     pushplusToken: 'push-token',
     tokenPath: 'token.env',
-    authorization: 'Bearer expired-token',
+    authorization: `Bearer ${expiredToken}`,
     term: '2026春',
   };
 
   const result = await run(config, {
     fetchScoreRowsFn: async () => {
-      calls.push('fetch-expired');
-      const error = new Error('expired');
-      error.code = 'BBGU_AUTH_EXPIRED';
-      throw error;
+      calls.push('unexpected-fetch-expired');
+      throw new Error('本地已知Access过期时不应先请求成绩接口');
     },
     recoverDirectApiAfterAuthExpiredFn: async (nextConfig) => {
       calls.push(`recover:${nextConfig.tokenPath}`);
@@ -1411,7 +2133,6 @@ test('run starts automatic login recovery when saved direct API token is expired
   });
 
   assert.deepEqual(calls, [
-    'fetch-expired',
     'recover:token.env',
     'process:Bearer renewed-token:1',
   ]);
@@ -1596,11 +2317,27 @@ test('CAS成功后的本地清理失败不标记CAS失效且不调用Refresh', a
   assert.deepEqual(calls, ['cas', 'clear']);
 });
 
+test('CAS本地或浏览器故障不标记失效且不调用Refresh', async () => {
+  const calls = [];
+  const localError = new Error('storage state write failed');
+
+  await assert.rejects(runRenew({ tokenPath: 'token.env' }, {
+    readQrReminderStateFn: async () => null,
+    runSilentRenewFn: async () => { calls.push('cas'); throw localError; },
+    markCasExpiredFn: async () => calls.push('mark-cas-expired'),
+    refreshAndSaveAuthStateFn: async () => calls.push('refresh'),
+  }), (error) => error === localError);
+
+  assert.deepEqual(calls, ['cas']);
+});
+
 test('CAS首次失败后记录失效并使用Refresh续Access', async () => {
   const calls = [];
+  const casExpiredError = new Error('CAS已失效');
+  casExpiredError.code = 'BBGU_CAS_EXPIRED';
   const result = await runRenew({}, {
     readQrReminderStateFn: async () => null,
-    runSilentRenewFn: async () => { calls.push('cas'); throw new Error('CAS已失效'); },
+    runSilentRenewFn: async () => { calls.push('cas'); throw casExpiredError; },
     markCasExpiredFn: async () => calls.push('mark-cas-expired'),
     refreshAndSaveAuthStateFn: async () => { calls.push('refresh'); return { accessToken: 'new.access' }; },
     clearQrReminderScheduleFn: async () => calls.push('clear-schedule'),
@@ -1947,6 +2684,37 @@ test('requestRefreshedAuthState posts verified form and keeps old refresh token 
   assert.equal(calls[0].options.headers['content-type'], 'application/x-www-form-urlencoded');
 });
 
+test('saveBrowserAuthState缺少新Refresh时保留旧Refresh', async () => {
+  const saved = [];
+  const result = await saveBrowserAuthState({}, { tokenPath: 'token.env' }, {
+    waitForAuthStateFn: async () => ({ accessToken: 'browser.access', refreshToken: '' }),
+    readSavedAuthStateFn: async () => ({ accessToken: 'old.access', refreshToken: 'old.refresh' }),
+    saveAuthStateFn: async (filePath, state) => saved.push({ filePath, state }),
+  });
+
+  assert.deepEqual(result, { accessToken: 'browser.access', refreshToken: 'old.refresh' });
+  assert.deepEqual(saved, [{
+    filePath: 'token.env',
+    state: { accessToken: 'browser.access', refreshToken: 'old.refresh' },
+  }]);
+});
+
+test('登录页导航网络失败时记录节点但不在本次重试', async () => {
+  let navigations = 0;
+  const failures = [];
+  const error = Object.assign(new Error('net::ERR_TIMED_OUT'), { code: 'ERR_TIMED_OUT' });
+  await assert.rejects(navigateToLoginPage({
+    goto: async () => {
+      navigations += 1;
+      throw error;
+    },
+  }, 'https://zhjw.bbgu.edu.cn/workspace/home', {
+    onNetworkFailureFn: async (caught) => failures.push(caught.code),
+  }), (caught) => caught === error);
+  assert.equal(navigations, 1);
+  assert.deepEqual(failures, ['ERR_TIMED_OUT']);
+});
+
 test('requestRefreshedAuthState保留OAuth错误类型供失效判断', async () => {
   await assert.rejects(
     requestRefreshedAuthState(
@@ -2026,32 +2794,44 @@ test('requestRefreshedAuthState aborts a hanging refresh request', async () => {
   );
 });
 
-test('refreshAndSaveAuthState retries a transient failure and saves rotated tokens', async () => {
+test('Refresh网络失败只记录当前节点且不在本次重发', async () => {
+  let requests = 0;
+  const recorded = [];
+  await assert.rejects(requestRefreshedAuthState({
+    homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
+    proxyServer: 'http://127.0.0.1:7890',
+  }, {
+    accessToken: 'old.access',
+    refreshToken: 'old.refresh',
+  }, {
+    proxyHttpsRequestFn: async () => {
+      requests += 1;
+      throw Object.assign(new Error('response incomplete'), { code: 'ERR_HTTP_RESPONSE_INCOMPLETE' });
+    },
+    recordCurrentProxyFailureFn: async (error) => recorded.push(error.code),
+  }), /response incomplete/);
+  assert.equal(requests, 1);
+  assert.deepEqual(recorded, ['ERR_HTTP_RESPONSE_INCOMPLETE']);
+});
+
+test('refreshAndSaveAuthState does not retry a transient failure', async () => {
   let requestCalls = 0;
-  const saved = [];
   const config = {
     homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
     tokenPath: 'token.env',
     storageStatePath: 'storage.json',
   };
 
-  const result = await refreshAndSaveAuthState(config, {
+  await assert.rejects(refreshAndSaveAuthState(config, {
     readSavedAuthStateFn: async () => ({ accessToken: 'old.access', refreshToken: 'old.refresh' }),
     requestFn: async () => {
       requestCalls += 1;
-      if (requestCalls === 1) throw new Error('temporary network failure');
-      return { accessToken: 'new.access', refreshToken: 'new.refresh' };
+      throw new Error('temporary network failure');
     },
-    saveAuthStateFn: async (filePath, state) => saved.push({ filePath, state }),
-  });
+    saveAuthStateFn: async () => assert.fail('failed Refresh must not save state'),
+  }), /temporary network failure/);
 
-  assert.equal(requestCalls, 2);
-  assert.equal(config.authorization, 'Bearer new.access');
-  assert.deepEqual(result.authState, { accessToken: 'new.access', refreshToken: 'new.refresh' });
-  assert.deepEqual(saved, [{
-    filePath: 'token.env',
-    state: { accessToken: 'new.access', refreshToken: 'new.refresh' },
-  }]);
+  assert.equal(requestCalls, 1);
 });
 
 test('refreshAndSaveAuthState保存失败时不再次请求Refresh', async () => {
@@ -2079,12 +2859,12 @@ test('refreshAndSaveAuthState保存失败时不再次请求Refresh', async () =>
   assert.equal(saveCalls, 1);
 });
 
-test('refreshAndSaveAuthState retries HTTP 5xx once', async () => {
+test('refreshAndSaveAuthState does not retry HTTP 5xx', async () => {
   let requestCalls = 0;
   const error = new Error('server unavailable');
   error.httpStatus = 503;
 
-  await refreshAndSaveAuthState({
+  await assert.rejects(refreshAndSaveAuthState({
     homeUrl: 'https://zhjw.bbgu.edu.cn/workspace/home',
     tokenPath: 'token.env',
     storageStatePath: 'storage.json',
@@ -2092,13 +2872,12 @@ test('refreshAndSaveAuthState retries HTTP 5xx once', async () => {
     readSavedAuthStateFn: async () => ({ accessToken: 'old.access', refreshToken: 'old.refresh' }),
     requestFn: async () => {
       requestCalls += 1;
-      if (requestCalls === 1) throw error;
-      return { accessToken: 'new.access', refreshToken: 'new.refresh' };
+      throw error;
     },
     saveAuthStateFn: async () => undefined,
-  });
+  }), /server unavailable/);
 
-  assert.equal(requestCalls, 2);
+  assert.equal(requestCalls, 1);
 });
 
 test('refreshAndSaveAuthState does not retry explicit HTTP 4xx', async () => {
@@ -2169,14 +2948,6 @@ test('extractWeixinQrInfoFromHtml parses WeChat qrconnect HTML', () => {
     qrImageUrl: 'https://open.weixin.qq.com/connect/qrcode/081F0Nk32c8XFa15',
     qrConfirmUrl: 'https://open.weixin.qq.com/connect/confirm?uuid=081F0Nk32c8XFa15',
   });
-});
-
-test('extractWeixinQrConnectUrlFromHtml parses combined login HTML', () => {
-  const html = '<script>location.href="https://open.weixin.qq.com/connect/qrconnect?appid=wx123&amp;redirect_uri=https%3A%2F%2Fauthserver.bbgu.edu.cn%2Fcallback&amp;state=abc";</script>';
-  assert.equal(
-    extractWeixinQrConnectUrlFromHtml(html),
-    'https://open.weixin.qq.com/connect/qrconnect?appid=wx123&redirect_uri=https%3A%2F%2Fauthserver.bbgu.edu.cn%2Fcallback&state=abc'
-  );
 });
 
 test('selectChromiumExecutable prefers system Chromium on Alpine over Playwright glibc build', () => {

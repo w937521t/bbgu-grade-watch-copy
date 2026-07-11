@@ -6,6 +6,7 @@ const fsp = require('node:fs/promises');
 const https = require('node:https');
 const net = require('node:net');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const tls = require('node:tls');
 const util = require('node:util');
 
@@ -19,8 +20,8 @@ const BBGU_OAUTH_CLIENT_SECRET = 'app-a-1234';
 const BBGU_REFRESH_TIMEOUT_MS = 15000;
 const BBGU_API_TIMEOUT_MS = 30000;
 const PUSHPLUS_TIMEOUT_MS = 30000;
-const QR_METADATA_TIMEOUT_MS = 15000;
 const PUSHPLUS_CONTENT_MAX_CHARS = 19000;
+const PROXY_FAILURE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const SUBSCORE_LIST_KEYS = ['subScoreList', 'detailScoreList', 'scoreItemList'];
 const SUBSCORE_NAME_FIELDS = ['subName', 'scoreName', 'itemName', 'name', 'componentName', 'partName', 'assessmentName', 'subScoreName', '项目', '名称'];
 const SUBSCORE_WEIGHT_FIELDS = ['weight', 'ratio', 'percent', 'proportion', 'scorePercent', 'percentage', 'scale', '占比', '权重'];
@@ -693,89 +694,6 @@ function buildWeixinQrConfirmUrl(value) {
   return uuid ? `https://open.weixin.qq.com/connect/confirm?uuid=${encodeURIComponent(uuid)}` : '';
 }
 
-function decodeHtmlEntities(value) {
-  return String(value || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
-}
-
-function extractWeixinQrConnectUrlFromHtml(html) {
-  const text = decodeHtmlEntities(html);
-  const match = text.match(/https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect[^"'<>\\\s]+/i);
-  return match ? clean(match[0]) : '';
-}
-
-async function fetchText(url, options = {}) {
-  const fetchFn = options.fetchFn || fetch;
-  const timeoutMs = options.timeoutMs || QR_METADATA_TIMEOUT_MS;
-  const { response, text } = await fetchWithTimeout(
-    async (targetUrl, requestOptions) => {
-      const response = await fetchFn(targetUrl, requestOptions);
-      return { response, text: await response.text() };
-    },
-    url,
-    {
-      redirect: 'follow',
-      headers: {
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-        ...options.headers,
-      },
-    },
-    timeoutMs,
-    '二维码辅助请求'
-  );
-  return { url: response.url || url, status: response.status, text };
-}
-
-async function fetchWeixinQrInfoFromPage(page) {
-  const urls = await page.evaluate(() => {
-    const values = [];
-    for (const element of Array.from(document.querySelectorAll('iframe[src], a[href]'))) {
-      const value = element.src || element.href || '';
-      if (/combinedLogin\.do|open\.weixin\.qq\.com\/connect\/qrconnect/i.test(value)) values.push(value);
-    }
-    return values;
-  }).catch(() => []);
-
-  for (const url of urls) {
-    try {
-      let qrConnectUrl = /^https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect/i.test(url) ? url : '';
-      if (!qrConnectUrl && /combinedLogin\.do/i.test(url)) {
-        const combined = await page.evaluate(async ({ targetUrl, timeoutMs }) => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const response = await fetch(targetUrl, {
-              credentials: 'include',
-              redirect: 'follow',
-              signal: controller.signal,
-            });
-            return { url: response.url, text: await response.text() };
-          } finally {
-            clearTimeout(timer);
-          }
-        }, { targetUrl: url, timeoutMs: QR_METADATA_TIMEOUT_MS }).catch(async () => fetchText(url));
-        qrConnectUrl = extractWeixinQrConnectUrlFromHtml(combined.text);
-        if (!qrConnectUrl && /^https:\/\/open\.weixin\.qq\.com\/connect\/qrconnect/i.test(combined.url)) {
-          qrConnectUrl = combined.url;
-        }
-      }
-      if (!qrConnectUrl) continue;
-
-      const qrPage = await fetchText(qrConnectUrl);
-      const info = extractWeixinQrInfoFromHtml(qrPage.text, qrConnectUrl);
-      if (info) return info;
-    } catch {
-      // Try the next candidate URL.
-    }
-  }
-
-  return null;
-}
-
 function createWeixinQrCapture(page) {
   let captured = null;
   const waiters = [];
@@ -919,9 +837,24 @@ async function readJson(filePath, fallback) {
   }
 }
 
+async function writeFileAtomic(filePath, content, deps = {}) {
+  const mkdirFn = deps.mkdirFn || fsp.mkdir;
+  const writeFileFn = deps.writeFileFn || fsp.writeFile;
+  const renameFn = deps.renameFn || fsp.rename;
+  const rmFn = deps.rmFn || fsp.rm;
+  await mkdirFn(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFileFn(tempPath, content, 'utf8');
+    await renameFn(tempPath, filePath);
+  } catch (error) {
+    await rmFn(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 async function writeJson(filePath, value) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await writeFileAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 async function readQrReminderState(config) {
@@ -1037,7 +970,13 @@ function getConfig(env = process.env) {
     tokenPath: path.resolve(path.join(dataDir, 'bbgu_token.env')),
     storageStatePath: path.join(dataDir, 'bbgu_storage_state.json'),
     snapshotPath: path.join(dataDir, 'bbgu_grade_snapshot.json'),
+    pendingNotificationPath: path.join(dataDir, 'bbgu_pending_notification.json'),
     qrReminderStatePath: path.join(dataDir, 'bbgu_qr_reminder_state.json'),
+    proxyStatePath: path.join(dataDir, 'bbgu_proxy_state.json'),
+    proxyCandidatesPath: path.join(dataDir, 'bbgu_proxy_candidates.json'),
+    networkStatePath: path.join(dataDir, 'bbgu_network_state.json'),
+    mihomoController: clean(env.BBGU_MIHOMO_CONTROLLER || 'http://127.0.0.1:9090'),
+    mihomoProxyGroup: clean(env.BBGU_MIHOMO_PROXY_GROUP || 'BBGU-STICKY'),
     diagnosticDir: path.join(dataDir, 'bbgu_diagnostics'),
     headless: true,
     loginWaitSeconds: parsePositiveIntegerEnv(env.BBGU_LOGIN_WAIT_SECONDS, 600),
@@ -1067,54 +1006,254 @@ async function saveAuthState(filePath, state) {
   const accessToken = unquoteToken(state && state.accessToken);
   const refreshToken = unquoteToken(state && state.refreshToken);
   if (!accessToken) throw new Error('Cannot save empty BBGU access token.');
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
   const lines = [
     '# Generated by bbgu_grade_watch.js. Do not share this file.',
     `BBGU_ACCESS_TOKEN=${accessToken}`,
     ...(refreshToken ? [`BBGU_REFRESH_TOKEN=${refreshToken}`] : []),
     '',
   ];
-  await fsp.writeFile(filePath, lines.join('\n'), 'utf8');
+  await writeFileAtomic(filePath, lines.join('\n'));
 }
 
 async function readStorageState(filePath) {
   return readJson(filePath, { cookies: [], origins: [] });
 }
 
-function requestRefreshWithHttps(url, options) {
-  return new Promise((resolve, reject) => {
-    const body = options.body || '';
-    const request = https.request(url, {
-      method: 'POST',
-      headers: {
-        ...options.headers,
-        'content-length': Buffer.byteLength(body),
-      },
-      timeout: options.timeoutMs,
-      family: 4,
-      insecureHTTPParser: true,
-    }, (response) => {
-      const chunks = [];
-      response.setEncoding('utf8');
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => {
-        const status = response.statusCode || 0;
-        const text = chunks.join('');
-        resolve({
-          ok: status >= 200 && status < 300,
-          status,
-          text: async () => text,
-        });
-      });
-    });
+function isNetworkTransportError(error) {
+  if (!error || error.httpStatus) return false;
+  const details = [];
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current.name) details.push(String(current.name));
+    if (current.code) details.push(String(current.code));
+    if (current.message) details.push(String(current.message));
+    current = current.cause;
+  }
+  return /ECONN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ERR_HTTP_RESPONSE_(?:ABORTED|INCOMPLETE)|AbortError|\btimeout\b|timed out|TLS|socket|network|fetch failed|net::ERR_(?:CONNECTION|TIMED_OUT|TUNNEL|PROXY)/i.test(details.join('\n'));
+}
 
-    request.on('timeout', () => {
-      request.destroy(new Error(`Refresh原生HTTPS请求在${options.timeoutMs}毫秒后超时。`));
-    });
-    request.on('error', (error) => reject(error));
-    request.write(body);
-    request.end();
+function isSafeCasFailoverError(error) {
+  if (!error || error.httpStatus) return false;
+  const details = [];
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current.code) details.push(String(current.code));
+    if (current.message) details.push(String(current.message));
+    current = current.cause;
+  }
+  return /EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED|EPROTO|ERR_(?:PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|NAME_NOT_RESOLVED|ADDRESS_UNREACHABLE|CONNECTION_REFUSED|SSL_PROTOCOL_ERROR|CERT_)|TLS handshake/i.test(details.join('\n'));
+}
+
+function isSafeApiFailoverError(error) {
+  if (!error || error.httpStatus) return false;
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current.stage) {
+      return ['proxy-tcp', 'connect', 'target-tls'].includes(clean(current.stage));
+    }
+    current = current.cause;
+  }
+  const details = [];
+  current = error;
+  seen.clear();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current.code) details.push(String(current.code));
+    if (current.message) details.push(String(current.message));
+    current = current.cause;
+  }
+  return /EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED|ERR_(?:PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|NAME_NOT_RESOLVED|ADDRESS_UNREACHABLE|CONNECTION_REFUSED)|TLS handshake/i.test(details.join('\n'));
+}
+
+function activeFailedNodes(proxyState, nowMs = Date.now()) {
+  const failedNodes = isPlainObject(proxyState && proxyState.failedNodes) ? proxyState.failedNodes : {};
+  return Object.fromEntries(Object.entries(failedNodes)
+    .map(([name, failedUntil]) => [clean(name), Number(failedUntil)])
+    .filter(([name, failedUntil]) => name && Number.isFinite(failedUntil) && failedUntil > nowMs));
+}
+
+function selectStartupProxy(proxyState, candidates, nowMs = Date.now()) {
+  const names = (Array.isArray(candidates) ? candidates : []).map(clean).filter(Boolean);
+  const failedNodes = activeFailedNodes(proxyState, nowMs);
+  const selected = clean(proxyState && proxyState.selectedProxy);
+  if (selected && names.includes(selected) && !failedNodes[selected]) return selected;
+  return names.find((name) => !failedNodes[name]) || '';
+}
+
+async function readProxyRuntime(config, nowMs = Date.now()) {
+  const proxyState = await readJson(config.proxyStatePath, {});
+  const candidateState = await readJson(config.proxyCandidatesPath, []);
+  const candidates = Array.isArray(candidateState)
+    ? candidateState
+    : Array.isArray(candidateState.candidates) ? candidateState.candidates : [];
+  const failedNodes = activeFailedNodes(proxyState, nowMs);
+  return {
+    current: clean(proxyState.selectedProxy),
+    candidates: candidates.map(clean).filter((name) => name && !failedNodes[name]),
+    failedNodes,
+  };
+}
+
+async function selectMihomoProxy(config, name, fetchFn = fetch) {
+  const controller = clean(config.mihomoController);
+  const group = clean(config.mihomoProxyGroup);
+  if (!controller || !group) throw new Error('Mihomo controller configuration is incomplete.');
+  const response = await fetchFn(`${controller}/proxies/${encodeURIComponent(group)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
   });
+  if (!response.ok) {
+    const error = new Error(`Mihomo node switch failed: HTTP ${response.status}`);
+    error.httpStatus = response.status;
+    throw error;
+  }
+}
+
+async function saveSelectedProxy(config, name) {
+  if (!config.proxyStatePath) return;
+  const previous = await readJson(config.proxyStatePath, {});
+  const failedNodes = activeFailedNodes(previous);
+  delete failedNodes[name];
+  await writeJson(config.proxyStatePath, {
+    selectedProxy: name,
+    failedNodes,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+async function markProxyFailed(config, name, nowMs = Date.now()) {
+  if (!config.proxyStatePath || !clean(name)) return;
+  const previous = await readJson(config.proxyStatePath, {});
+  const failedNodes = activeFailedNodes(previous, nowMs);
+  failedNodes[clean(name)] = nowMs + PROXY_FAILURE_COOLDOWN_MS;
+  await writeJson(config.proxyStatePath, {
+    ...previous,
+    failedNodes,
+    updatedAt: new Date(nowMs).toISOString(),
+  });
+}
+
+async function recordCurrentProxyFailure(config, error, deps = {}) {
+  if (!isNetworkTransportError(error) || !config || !config.proxyStatePath) return false;
+  const nowFn = deps.nowFn || Date.now;
+  const readProxyRuntimeFn = deps.readProxyRuntimeFn || readProxyRuntime;
+  const markProxyFailedFn = deps.markProxyFailedFn || ((name, nowMs) => markProxyFailed(config, name, nowMs));
+  const runtime = await readProxyRuntimeFn(config, nowFn());
+  if (!runtime.current) return false;
+  await markProxyFailedFn(runtime.current, nowFn());
+  return true;
+}
+
+const proxyFailoverStateByConfig = new WeakMap();
+
+async function withSingleProxyFailover(config, operation, deps = {}) {
+  const readProxyRuntimeFn = deps.readProxyRuntimeFn || readProxyRuntime;
+  const selectProxyFn = deps.selectProxyFn || ((name) => selectMihomoProxy(config, name));
+  const saveProxyFn = deps.saveProxyFn || ((name) => saveSelectedProxy(config, name));
+  const markProxyFailedFn = deps.markProxyFailedFn || ((name, nowMs) => markProxyFailed(config, name, nowMs));
+  const shouldFailoverFn = deps.shouldFailoverFn || isSafeApiFailoverError;
+  const nowFn = deps.nowFn || Date.now;
+  let taskState = proxyFailoverStateByConfig.get(config);
+  if (!taskState) {
+    taskState = { used: false };
+    proxyFailoverStateByConfig.set(config, taskState);
+  }
+  try {
+    return await operation();
+  } catch (firstError) {
+    if (!isNetworkTransportError(firstError)) throw firstError;
+    const runtime = await readProxyRuntimeFn(config, nowFn());
+    await markProxyFailedFn(runtime.current, nowFn());
+    if (!shouldFailoverFn(firstError)) {
+      firstError.code = 'BBGU_PROXY_NETWORK_FAILED';
+      throw firstError;
+    }
+    if (taskState.used) {
+      firstError.code = 'BBGU_PROXY_FAILOVER_EXHAUSTED';
+      throw firstError;
+    }
+    const replacement = runtime.candidates.find((name) => name !== runtime.current);
+    if (!replacement) {
+      firstError.code = 'BBGU_PROXY_FAILOVER_EXHAUSTED';
+      throw firstError;
+    }
+
+    console.log(`[BBGU] 粘性节点网络失败，本次仅切换一个候选节点重试：${runtime.current || 'unknown'} -> ${replacement}`);
+    taskState.used = true;
+    await selectProxyFn(replacement);
+    try {
+      const result = await operation();
+      await saveProxyFn(replacement);
+      return result;
+    } catch (secondError) {
+      if (!isNetworkTransportError(secondError)) {
+        await saveProxyFn(replacement);
+        throw secondError;
+      }
+      await markProxyFailedFn(replacement, nowFn());
+      secondError.code = 'BBGU_PROXY_FAILOVER_EXHAUSTED';
+      throw secondError;
+    }
+  }
+}
+
+async function markWatchNetworkFailure(config, nowMs = Date.now()) {
+  if (!config.networkStatePath) return;
+  await writeJson(config.networkStatePath, { skipNextWatch: true, failedAt: nowMs });
+}
+
+function retryAfterDeadline(value, nowMs) {
+  const text = clean(value);
+  if (/^\d+$/.test(text)) return nowMs + Number(text) * 1000;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) && parsed > nowMs ? parsed : nowMs + 2 * HOUR_MS;
+}
+
+async function markSchoolBackoff(config, error, nowMs = Date.now()) {
+  if (!config.networkStatePath) return;
+  const previous = await readJson(config.networkStatePath, {});
+  const httpStatus = Number(error && error.httpStatus);
+  if (httpStatus === 429) {
+    await writeJson(config.networkStatePath, {
+      ...previous,
+      schoolBackoffUntil: retryAfterDeadline(error && error.retryAfter, nowMs),
+      schoolBackoffStatus: httpStatus,
+      failedAt: nowMs,
+    });
+    return;
+  }
+  if (httpStatus >= 500 && httpStatus <= 599) {
+    await writeJson(config.networkStatePath, {
+      ...previous,
+      skipNextWatch: true,
+      schoolBackoffStatus: httpStatus,
+      failedAt: nowMs,
+    });
+  }
+}
+
+async function consumeWatchNetworkCooldown(config, nowMs = Date.now()) {
+  if (!config.networkStatePath) return false;
+  const state = await readJson(config.networkStatePath, null);
+  if (!state) return false;
+  if (Number.isFinite(state.schoolBackoffUntil)) {
+    if (nowMs < state.schoolBackoffUntil) return true;
+    delete state.schoolBackoffUntil;
+    delete state.schoolBackoffStatus;
+  }
+  if (state.skipNextWatch) {
+    await fsp.rm(config.networkStatePath, { force: true });
+    return true;
+  }
+  await fsp.rm(config.networkStatePath, { force: true });
+  return false;
 }
 
 function requestRefreshWithHttpsProxy(url, options, proxyServer) {
@@ -1196,20 +1335,15 @@ function requestRefreshWithHttpsProxy(url, options, proxyServer) {
           createConnection: () => secureSocket,
           insecureHTTPParser: true,
         }, (response) => {
-          const chunks = [];
-          response.setEncoding('utf8');
-          response.on('data', (responseChunk) => chunks.push(responseChunk));
-          response.on('end', () => {
+          readRefreshResponse(response).then(({ status, text }) => {
             if (settled) return;
             settled = true;
-            const status = response.statusCode || 0;
-            const text = chunks.join('');
             resolve({
               ok: status >= 200 && status < 300,
               status,
               text: async () => text,
             });
-          });
+          }, finishReject);
         });
 
         request.on('timeout', () => {
@@ -1226,10 +1360,10 @@ function requestRefreshWithHttpsProxy(url, options, proxyServer) {
 
 async function requestRefreshedAuthState(config, current, deps = {}) {
   const fetchFn = deps.fetchFn || fetch;
-  const httpsRequestFn = deps.httpsRequestFn || (!deps.fetchFn ? requestRefreshWithHttps : null);
   const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || (!deps.fetchFn ? requestRefreshWithHttpsProxy : null);
   const proxyServer = clean(deps.proxyServer || (config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
   const timeoutMs = deps.timeoutMs || BBGU_REFRESH_TIMEOUT_MS;
+  const recordCurrentProxyFailureFn = deps.recordCurrentProxyFailureFn || ((error) => recordCurrentProxyFailure(config, error));
   if (!current || !current.refreshToken) {
     const error = new Error('No saved BBGU refresh token.');
     error.code = 'BBGU_REFRESH_UNAVAILABLE';
@@ -1253,26 +1387,14 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
       body,
       signal: controller.signal,
     };
-    let response;
-    try {
-      response = await fetchFn(url, options);
-    } catch (error) {
-      if (!httpsRequestFn && !(proxyServer && proxyHttpsRequestFn)) throw error;
-      const cause = error && error.cause ? error.cause : error;
-      const fallbackOptions = {
+    const response = proxyServer && proxyHttpsRequestFn
+      ? await proxyHttpsRequestFn(url, {
         method: options.method,
         headers: options.headers,
         body,
         timeoutMs,
-      };
-      if (proxyServer && proxyHttpsRequestFn) {
-        console.log(`[BBGU] Refresh内置请求失败，改用代理HTTPS。原因：${cause && (cause.code || cause.message)}`);
-        response = await proxyHttpsRequestFn(url, fallbackOptions, proxyServer);
-      } else {
-        console.log(`[BBGU] Refresh内置请求失败，改用原生HTTPS。原因：${cause && (cause.code || cause.message)}`);
-        response = await httpsRequestFn(url, fallbackOptions);
-      }
-    }
+      }, proxyServer)
+      : await fetchFn(url, options);
     const text = await response.text();
     let payload;
     try {
@@ -1297,6 +1419,9 @@ async function requestRefreshedAuthState(config, current, deps = {}) {
       accessToken: unquoteToken(payload.access_token),
       refreshToken: unquoteToken(payload.refresh_token) || current.refreshToken,
     };
+  } catch (error) {
+    if (isNetworkTransportError(error)) await recordCurrentProxyFailureFn(error);
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -1321,39 +1446,35 @@ async function refreshAndSaveAuthState(config, deps = {}) {
     }
   }
 
-  let lastError;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    let refreshed;
-    try {
-      refreshed = await requestFn(config, current, deps);
-    } catch (error) {
-      lastError = error;
-      const retryable = !error.httpStatus || error.httpStatus >= 500;
-      if (!retryable || attempt === 2 || error.code === 'BBGU_REFRESH_UNAVAILABLE') break;
-      console.log(`[BBGU] Refresh request failed; retrying once. reason=${error.message || error}`);
-      continue;
-    }
-
-    await saveAuthStateFn(config.tokenPath, refreshed);
-    config.authorization = buildAuthorizationHeader(refreshed.accessToken);
-    return { status: 'refresh_ok', authState: refreshed };
-  }
-  throw lastError;
+  const refreshed = await requestFn(config, current, deps);
+  await saveAuthStateFn(config.tokenPath, refreshed);
+  config.authorization = buildAuthorizationHeader(refreshed.accessToken);
+  return { status: 'refresh_ok', authState: refreshed };
 }
 
-function isAuthExpiredResponse({ httpStatus, text, body }) {
-  if (httpStatus === 401 || httpStatus === 403) return true;
+function responseHeader(headers, name) {
+  if (!headers) return '';
+  if (typeof headers.get === 'function') return clean(headers.get(name));
+  const target = String(name).toLowerCase();
+  const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === target);
+  return key ? clean(headers[key]) : '';
+}
+
+function isAuthExpiredResponse({ httpStatus, text, body, headers }) {
+  if (httpStatus === 401) return true;
   if (httpStatus >= 500) return false;
-  if (/统一身份认证|扫码登录|cas|login/i.test(text || '')) return true;
+  if ([301, 302, 303, 307, 308].includes(httpStatus)) {
+    const location = responseHeader(headers, 'location');
+    return /authserver\.bbgu\.edu\.cn|\/authserver\/|(?:^|\/)cas(?:[/?]|$)|(?:^|\/)login(?:[/?]|$)/i.test(location);
+  }
+  if (httpStatus >= 200 && httpStatus < 300 && /统一身份认证|扫码登录|cas|login/i.test(text || '')) return true;
   if (!body || typeof body !== 'object') return false;
   const status = clean(body.status).toLowerCase();
   const msg = clean(body.msg || body.message || body.error);
   if (status && status !== 'success') {
     return /token|auth|login|登录|认证|过期|失效|未授权|unauthorized|expired/i.test(`${status} ${msg}`);
   }
-  if (body.ok === false) {
-    return /token|auth|login|登录|认证|过期|失效|未授权|unauthorized|expired/i.test(msg) || httpStatus !== 200;
-  }
+  if (body.ok === false) return /token|auth|login|登录|认证|过期|失效|未授权|unauthorized|expired/i.test(msg);
   return false;
 }
 
@@ -1384,39 +1505,61 @@ function buildBbguApiHeaders(config, refererPath = '/workspace/home') {
   return headers;
 }
 
-async function fetchBbguScoreRows(config) {
-  const response = await requestJsonText(BBGU_SCORE_API_URL, buildBbguApiHeaders(config));
+function createScoreApiError(message, response) {
+  const error = new Error(message);
+  error.httpStatus = Number(response && response.status) || 0;
+  const retryAfter = responseHeader(response && response.headers, 'retry-after');
+  if (retryAfter) error.retryAfter = retryAfter;
+  return error;
+}
+
+async function fetchBbguScoreRows(config, deps = {}) {
+  const requestJsonTextFn = deps.requestJsonTextFn || requestJsonText;
+  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
+  const headers = buildBbguApiHeaders(config);
+  const proxyServer = clean((config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
+  const response = proxyServer
+    ? await withProxyFailoverFn(config, () => proxyHttpsRequestFn(BBGU_SCORE_API_URL, headers, proxyServer))
+    : await requestJsonTextFn(BBGU_SCORE_API_URL, headers);
 
   const text = response.text;
   let body;
   try {
     body = JSON.parse(text);
   } catch {
-    if (isAuthExpiredResponse({ httpStatus: response.status, text, body: null })) {
+    if (isAuthExpiredResponse({ httpStatus: response.status, text, body: null, headers: response.headers })) {
       const error = new Error('BBGU login state expired. GitHub Actions will try refresh token or QR login.');
       error.code = 'BBGU_AUTH_EXPIRED';
       throw error;
     }
-    throw new Error(`BBGU score API returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`);
+    throw createScoreApiError(`BBGU score API returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`, response);
   }
 
-  if (isAuthExpiredResponse({ httpStatus: response.status, text, body })) {
+  if (isAuthExpiredResponse({ httpStatus: response.status, text, body, headers: response.headers })) {
     const error = new Error('BBGU login state expired. GitHub Actions will try refresh token or QR login.');
     error.code = 'BBGU_AUTH_EXPIRED';
     throw error;
   }
 
   if (response.status < 200 || response.status >= 300 || body.status !== 'success' || !body.ok) {
-    throw new Error(`BBGU score API failed HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw createScoreApiError(`BBGU score API failed HTTP ${response.status}: ${text.slice(0, 500)}`, response);
   }
 
   return normalizeBbguScoreApiData(body.data, config.term);
 }
 
-async function fetchBbguSubScores(scoreId, config) {
+async function fetchBbguSubScores(scoreId, config, deps = {}) {
+  const requestJsonTextFn = deps.requestJsonTextFn || requestJsonText;
+  const proxyHttpsRequestFn = deps.proxyHttpsRequestFn || requestJsonTextWithHttpsProxy;
+  const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
   const origin = getBbguOrigin(config);
   const url = `${origin}${BBGU_SUBSCORE_API_PATH}?scoreId=${encodeURIComponent(scoreId)}`;
-  const response = await requestJsonText(url, buildBbguApiHeaders(config, '/sam/home'));
+  const headers = buildBbguApiHeaders(config, '/sam/home');
+  const proxyServer = clean((config && config.proxyServer) || process.env.BBGU_PROXY_SERVER || '');
+  const response = proxyServer
+    ? await withProxyFailoverFn(config, () => proxyHttpsRequestFn(url, headers, proxyServer))
+    : await requestJsonTextFn(url, headers);
   return parseBbguSubscoreResponse(response);
 }
 
@@ -1433,7 +1576,7 @@ function parseBbguSubscoreResponse(response, options = {}) {
     throw new Error(`BBGU subscore API returned non-JSON HTTP ${response.status}: ${errorDetails(300)}`);
   }
 
-  if (isAuthExpiredResponse({ httpStatus: response.status, text: responseText, body })) {
+  if (isAuthExpiredResponse({ httpStatus: response.status, text: responseText, body, headers: response.headers })) {
     const error = new Error('BBGU login state expired while fetching subscore.');
     error.code = 'BBGU_AUTH_EXPIRED';
     throw error;
@@ -1587,6 +1730,7 @@ async function requestJsonText(url, headers, deps = {}) {
     return {
       status: response.status,
       text,
+      headers: response.headers,
       via: 'fetch',
     };
   } catch (error) {
@@ -1658,10 +1802,17 @@ function readHttpResponseText(response, stage = 'response-body') {
     };
     const finishResolve = () => {
       if (settled) return;
+      if (response.complete === false) {
+        const error = new Error('HTTP response ended before the complete message was received');
+        error.code = 'ERR_HTTP_RESPONSE_INCOMPLETE';
+        finishReject(error);
+        return;
+      }
       settled = true;
       resolve({
         status: response.statusCode || 0,
         text: chunks.join(''),
+        headers: response.headers,
       });
     };
 
@@ -1681,6 +1832,10 @@ function readHttpResponseText(response, stage = 'response-body') {
       finishReject(error);
     });
   });
+}
+
+function readRefreshResponse(response) {
+  return readHttpResponseText(response, 'response-body');
 }
 
 function requestJsonTextWithHttpsProxy(url, headers, proxyServer, deps = {}) {
@@ -1777,6 +1932,7 @@ function requestJsonTextWithHttpsProxy(url, headers, proxyServer, deps = {}) {
             resolve({
               status,
               text,
+              headers: response.headers,
               via: 'proxy-https',
             });
           }).catch(finishReject);
@@ -1797,7 +1953,60 @@ function requestJsonTextWithHttpsProxy(url, headers, proxyServer, deps = {}) {
   });
 }
 
-async function processGradeRows(currentRows, config) {
+function buildGradeNotificationId(term, diff) {
+  const identity = {
+    term,
+    added: diff.added.map((row) => [row.key, row.score]),
+    changed: diff.changed.map((item) => [item.after && item.after.key, item.before && item.before.score, item.after && item.after.score]),
+  };
+  return Buffer.from(JSON.stringify(identity), 'utf8').toString('base64url');
+}
+
+async function readPendingNotifications(config) {
+  if (!config.pendingNotificationPath) return { items: [] };
+  const state = await readJson(config.pendingNotificationPath, { items: [] });
+  return { items: Array.isArray(state && state.items) ? state.items : [] };
+}
+
+async function writePendingNotifications(config, state) {
+  if (!config.pendingNotificationPath) return;
+  if (!state.items.length) {
+    await fsp.rm(config.pendingNotificationPath, { force: true });
+    return;
+  }
+  await writeJson(config.pendingNotificationPath, state);
+}
+
+async function enqueuePendingNotification(config, notification) {
+  const state = await readPendingNotifications(config);
+  if (!state.items.some((item) => item.id === notification.id)) {
+    state.items.push(notification);
+    await writePendingNotifications(config, state);
+  }
+  return state;
+}
+
+async function flushPendingNotifications(config, deps = {}) {
+  const sendPushPlusFn = deps.sendPushPlusFn || sendPushPlus;
+  const state = await readPendingNotifications(config);
+  let sent = 0;
+  while (state.items.length) {
+    const item = state.items[0];
+    await sendPushPlusFn({
+      token: config.pushplusToken,
+      title: item.title,
+      content: item.content,
+    });
+    state.items.shift();
+    sent += 1;
+    await writePendingNotifications(config, state);
+  }
+  return sent;
+}
+
+async function processGradeRows(currentRows, config, deps = {}) {
+  const enrichRowsWithSubScoresFn = deps.enrichRowsWithSubScoresFn || enrichRowsWithSubScores;
+  const writeSnapshotFn = deps.writeSnapshotFn || writeJson;
   if (!currentRows.length) {
     throw new Error('No grade rows were extracted from BBGU score API/page.');
   }
@@ -1807,19 +2016,31 @@ async function processGradeRows(currentRows, config) {
   const diff = diffGrades(previousRows, rowsWithSavedSubScores);
 
   if (diff.added.length || diff.changed.length) {
-    await enrichRowsWithSubScores(diff, config);
-    await sendPushPlus({
-      token: config.pushplusToken,
-      title: `BBGU 成绩更新：新增 ${diff.added.length}，变更 ${diff.changed.length}`,
-      content: formatPushPlusGradeTextContent({ term: config.term, added: diff.added, changed: diff.changed, currentRows: rowsWithSavedSubScores }),
-    });
-    console.log(`[BBGU] Grade changes sent. added=${diff.added.length}, changed=${diff.changed.length}`);
+    const notificationId = buildGradeNotificationId(config.term, diff);
+    const pending = await readPendingNotifications(config);
+    if (!pending.items.some((item) => item.id === notificationId)) {
+      await enrichRowsWithSubScoresFn(diff, config);
+      await enqueuePendingNotification(config, {
+        id: notificationId,
+        title: `BBGU 成绩更新：新增 ${diff.added.length}，变更 ${diff.changed.length}`,
+        content: formatPushPlusGradeTextContent({ term: config.term, added: diff.added, changed: diff.changed, currentRows: rowsWithSavedSubScores }),
+        createdAt: new Date().toISOString(),
+      });
+    } else {
+      console.log('[BBGU] Reusing pending grade notification after an earlier snapshot failure.');
+    }
   } else {
     console.log(`[BBGU] No grade changes. count=${rowsWithSavedSubScores.length}`);
   }
 
-  await writeJson(config.snapshotPath, rowsWithSavedSubScores);
+  await writeSnapshotFn(config.snapshotPath, rowsWithSavedSubScores);
   console.log(`[BBGU] Snapshot saved: ${config.snapshotPath}`);
+  const sent = await flushPendingNotifications(config, deps);
+  if (diff.added.length || diff.changed.length) {
+    console.log(`[BBGU] Grade changes queued and sent. added=${diff.added.length}, changed=${diff.changed.length}`);
+  } else if (sent) {
+    console.log(`[BBGU] Pending grade notifications sent. count=${sent}`);
+  }
   return { status: 'ok', count: rowsWithSavedSubScores.length, ...diff };
 }
 
@@ -1836,18 +2057,60 @@ async function isAuthenticated(page) {
   return false;
 }
 
-async function createContext(browser, config) {
-  const options = {
+function sanitizeStorageStateForAccessRenewal(storageState, origin) {
+  const cloned = JSON.parse(JSON.stringify(storageState || { cookies: [], origins: [] }));
+  const accessKeys = new Set(['cqu_edu_ACCESS_TOKEN', 'cqu_edu_CURRENT_TOKEN']);
+  for (const entry of Array.isArray(cloned.origins) ? cloned.origins : []) {
+    if (clean(entry.origin) !== clean(origin) || !Array.isArray(entry.localStorage)) continue;
+    entry.localStorage = entry.localStorage.filter((item) => !accessKeys.has(clean(item && item.name)));
+  }
+  return cloned;
+}
+
+async function isExplicitCasLoginPage(page) {
+  let text = '';
+  try {
+    text = clean(await page.locator('body').innerText({ timeout: 3000 }));
+  } catch {
+    text = '';
+  }
+  if (/统一身份认证|扫码登录|微信扫码|二维码/.test(text)) return true;
+  try {
+    const currentUrl = new URL(page.url());
+    return currentUrl.hostname.toLowerCase() === 'authserver.bbgu.edu.cn'
+      && /(?:^|\/)login(?:[/?]|$)/i.test(`${currentUrl.pathname}${currentUrl.search}`);
+  } catch {
+    return false;
+  }
+}
+
+function createCasExpiredError(message, cause) {
+  const error = new Error(message, cause instanceof Error ? { cause } : undefined);
+  error.code = 'BBGU_CAS_EXPIRED';
+  return error;
+}
+
+async function createContext(browser, config, overrides = {}) {
+  const contextOptions = {
     viewport: { width: 1440, height: 1000 },
     locale: 'zh-CN',
     timezoneId: 'Asia/Shanghai',
   };
 
-  if (fs.existsSync(config.storageStatePath)) {
-    options.storageState = config.storageStatePath;
+  if (Object.hasOwn(overrides, 'storageState')) {
+    contextOptions.storageState = overrides.storageState;
+  } else if (fs.existsSync(config.storageStatePath)) {
+    contextOptions.storageState = config.storageStatePath;
   }
 
-  return browser.newContext(options);
+  return browser.newContext(contextOptions);
+}
+
+async function createAccessRenewalContext(browser, config, deps = {}) {
+  const readStorageStateFn = deps.readStorageStateFn || readStorageState;
+  const storageState = await readStorageStateFn(config.storageStatePath);
+  const sanitized = sanitizeStorageStateForAccessRenewal(storageState, getBbguOrigin(config));
+  return createContext(browser, config, { storageState: sanitized });
 }
 
 async function saveScreenshot(page, config, label) {
@@ -1940,13 +2203,17 @@ async function saveLoginTimeoutDiagnostics(page, config) {
   return { reportPath, screenshotPath };
 }
 
-async function waitForAuthenticationAfterQr(page, config) {
-  const deadline = Date.now() + config.loginWaitSeconds * 1000;
+async function waitForAuthenticationAfterQr(page, config, deps = {}) {
+  const nowFn = deps.nowFn || Date.now;
+  const extractAuthStateFn = deps.extractAuthStateFn || extractAuthStateFromPage;
+  const isAuthenticatedFn = deps.isAuthenticatedFn || isAuthenticated;
+  const deadline = nowFn() + config.loginWaitSeconds * 1000;
   console.log(`[BBGU] Waiting up to ${config.loginWaitSeconds}s for QR login...`);
 
-  while (Date.now() < deadline) {
+  while (nowFn() < deadline) {
+    const authState = await extractAuthStateFn(page);
+    if (authState.accessToken || await isAuthenticatedFn(page)) return true;
     await page.waitForTimeout(5000);
-    if (await isAuthenticated(page)) return true;
   }
 
   return false;
@@ -1967,12 +2234,27 @@ async function extractAuthStateFromPage(page) {
   };
 }
 
-async function waitForAuthState(page, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+async function shouldStartQrLogin(page, deps = {}) {
+  const extractAuthStateFn = deps.extractAuthStateFn || extractAuthStateFromPage;
+  const isAuthenticatedFn = deps.isAuthenticatedFn || isAuthenticated;
+  const authState = await extractAuthStateFn(page);
+  if (authState.accessToken) return false;
+  return !(await isAuthenticatedFn(page));
+}
+
+async function waitForAuthState(page, timeoutMs, deps = {}) {
+  const nowFn = deps.nowFn || Date.now;
+  const refreshGraceMs = deps.refreshGraceMs ?? 2000;
+  const deadline = nowFn() + timeoutMs;
   let latest = emptyAuthState();
-  while (Date.now() < deadline) {
+  let accessSeenAt = null;
+  while (nowFn() < deadline) {
     latest = await extractAuthStateFromPage(page);
     if (latest.accessToken && latest.refreshToken) return latest;
+    if (latest.accessToken) {
+      if (accessSeenAt === null) accessSeenAt = nowFn();
+      if (nowFn() - accessSeenAt >= refreshGraceMs) return latest;
+    }
     await page.waitForTimeout(2000);
   }
   return latest;
@@ -1981,15 +2263,61 @@ async function waitForAuthState(page, timeoutMs) {
 async function saveBrowserAuthState(page, config, deps = {}) {
   const waitForAuthStateFn = deps.waitForAuthStateFn || waitForAuthState;
   const saveAuthStateFn = deps.saveAuthStateFn || saveAuthState;
-  const authState = await waitForAuthStateFn(page, 30000);
+  const readSavedAuthStateFn = deps.readSavedAuthStateFn || readSavedAuthState;
+  const readQrReminderStateFn = deps.readQrReminderStateFn || readQrReminderState;
+  let authState = await waitForAuthStateFn(page, 30000);
   if (!authState.accessToken) {
     throw new Error('Login succeeded but cqu_edu_ACCESS_TOKEN was not found in localStorage.');
   }
-  await saveAuthStateFn(config.tokenPath, authState);
   if (!authState.refreshToken) {
-    console.log('[BBGU] Warning: login succeeded without a refresh token; next recovery will use CAS.');
+    const previous = await readSavedAuthStateFn(config.tokenPath);
+    const reminderState = await readQrReminderStateFn(config);
+    if (previous.refreshToken && !(reminderState && reminderState.refreshExpired)) {
+      authState = { ...authState, refreshToken: previous.refreshToken };
+      console.log('[BBGU] Warning: login produced no new refresh token; preserving the previously saved refresh token.');
+    } else {
+      console.log('[BBGU] Warning: login succeeded without a refresh token; next recovery will use CAS.');
+    }
   }
+  await saveAuthStateFn(config.tokenPath, authState);
   return authState;
+}
+
+async function finalizeLoginReminderState(config, authState, deps = {}) {
+  const clearQrReminderStateFn = deps.clearQrReminderStateFn || clearQrReminderState;
+  const writeJsonFn = deps.writeJsonFn || writeJson;
+  if (authState && authState.refreshToken) {
+    await clearQrReminderStateFn(config);
+    return;
+  }
+  if (config && config.qrReminderStatePath) {
+    await writeJsonFn(config.qrReminderStatePath, { refreshExpired: true });
+  }
+}
+
+async function collectLoginQrArtifacts(page, config, weixinQrCapture, deps = {}) {
+  const saveQrElementScreenshotFn = deps.saveQrElementScreenshotFn || saveQrElementScreenshot;
+  let weixinQrInfo = typeof weixinQrCapture.get === 'function' ? weixinQrCapture.get() : null;
+  let qrElementScreenshotPath = await saveQrElementScreenshotFn(page, config);
+  if (!weixinQrInfo && !qrElementScreenshotPath) {
+    weixinQrInfo = await weixinQrCapture.wait(5000);
+    qrElementScreenshotPath = await saveQrElementScreenshotFn(page, config);
+  }
+  return { weixinQrInfo, qrElementScreenshotPath };
+}
+
+async function saveBrowserStorageState(context, filePath, deps = {}) {
+  const renameFn = deps.renameFn || fsp.rename;
+  const rmFn = deps.rmFn || fsp.rm;
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await context.storageState({ path: tempPath });
+    await renameFn(tempPath, filePath);
+  } catch (error) {
+    await rmFn(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function selectChromiumExecutable({ osRelease, homeDir, exists, readdir }) {
@@ -2085,39 +2413,64 @@ async function withBrowserContext(config, createContextFn, callback) {
   }
 }
 
-async function runSilentRenew(config = getConfig()) {
-  return withBrowserContext(config, createContext, async (context) => {
-    const page = await context.newPage();
-    const origin = new URL(config.homeUrl).origin;
-
-    await page.goto(`${origin}/sam/home`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => undefined);
-    await clearBrowserAccessTokens(page);
-
-    const renewUrl = buildCasRenewUrl(config);
-    console.log(`[BBGU] Opening ${renewUrl} for silent CAS renew.`);
-    try {
-      await page.goto(renewUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
-    } catch (error) {
-      if (!isRecoverableNavigationAbort(error)) throw error;
-      console.log(`[BBGU] Silent CAS renew navigation was aborted by redirect; continuing token check. url=${page.url()}`);
-      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
-      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+async function performSilentRenew(context, config, deps = {}) {
+  const withProxyFailoverFn = deps.withProxyFailoverFn || withSingleProxyFailover;
+  const saveBrowserAuthStateFn = deps.saveBrowserAuthStateFn || saveBrowserAuthState;
+  await context.route('**/*', async (route) => {
+    const resourceType = route.request().resourceType();
+    if (resourceType === 'font' || resourceType === 'image' || resourceType === 'media') {
+      await route.abort();
+      return;
     }
-    await page.waitForTimeout(3000);
-
-    try {
-      await saveBrowserAuthState(page, config);
-    } catch (error) {
-      const screenshotPath = await saveScreenshot(page, config, 'silent-renew-failed');
-      throw new Error(`Silent CAS renew did not obtain complete browser auth state. url=${page.url()}; screenshot=${screenshotPath}; reason=${error.message || error}`);
-    }
-
-    await context.storageState({ path: config.storageStatePath });
-    console.log(`[BBGU] Silent CAS renew completed. Access token saved: ${config.tokenPath}`);
-    console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
-    return { status: 'renew_ok', tokenPath: config.tokenPath };
+    await route.continue();
   });
+
+  const page = await context.newPage();
+  const renewUrl = buildCasRenewUrl(config);
+  console.log(`[BBGU] Opening ${renewUrl} for silent CAS renew.`);
+  try {
+    await withProxyFailoverFn(
+      config,
+      async () => {
+        const response = await page.goto(renewUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await validateBrowserHttpResponse(response);
+        return response;
+      },
+      { shouldFailoverFn: isSafeCasFailoverError }
+    );
+  } catch (error) {
+    if (!isRecoverableNavigationAbort(error)) throw error;
+    console.log(`[BBGU] Silent CAS renew navigation was aborted by redirect; continuing token check. url=${page.url()}`);
+  }
+
+  if (await isExplicitCasLoginPage(page)) {
+    throw createCasExpiredError(`Silent CAS renew reached the login page. url=${page.url()}`);
+  }
+
+  try {
+    await saveBrowserAuthStateFn(page, config);
+  } catch (error) {
+    const screenshotPath = await saveScreenshot(page, config, 'silent-renew-failed').catch(() => 'unavailable');
+    if (await isExplicitCasLoginPage(page)) {
+      throw createCasExpiredError(`Silent CAS renew reached the login page. url=${page.url()}; screenshot=${screenshotPath}`, error);
+    }
+    throw new Error(`Silent CAS renew did not obtain complete browser auth state. url=${page.url()}; screenshot=${screenshotPath}; reason=${error.message || error}`);
+  }
+
+  await saveBrowserStorageState(context, config.storageStatePath);
+  console.log(`[BBGU] Silent CAS renew completed. Access token saved: ${config.tokenPath}`);
+  console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
+  return { status: 'renew_ok', tokenPath: config.tokenPath };
+}
+
+async function runSilentRenew(config = getConfig(), deps = {}) {
+  const withBrowserContextFn = deps.withBrowserContextFn || withBrowserContext;
+  const createAccessRenewalContextFn = deps.createAccessRenewalContextFn || createAccessRenewalContext;
+  return withBrowserContextFn(
+    config,
+    (browser, nextConfig) => createAccessRenewalContextFn(browser, nextConfig),
+    (context) => performSilentRenew(context, config, deps)
+  );
 }
 
 async function recoverDirectApiAfterAuthExpired(config, deps = {}) {
@@ -2222,7 +2575,7 @@ async function runSubscoreDiagnostic(config = getConfig(), deps = {}) {
   };
 }
 
-async function run(config = getConfig(), deps = {}) {
+async function runCore(config = getConfig(), deps = {}) {
   const {
     readSavedAuthStateFn = readSavedAuthState,
     fetchScoreRowsFn = fetchBbguScoreRows,
@@ -2231,6 +2584,7 @@ async function run(config = getConfig(), deps = {}) {
     readSavedAuthStateAfterLoginFn = readSavedAuthStateFn,
     processGradeRowsFn = processGradeRows,
     maybeRunScheduledQrFn = maybeRunScheduledQr,
+    nowFn = Date.now,
   } = deps;
 
   if (!config.pushplusToken) {
@@ -2271,13 +2625,19 @@ async function run(config = getConfig(), deps = {}) {
   if (config.authorization) {
     console.log('[BBGU] Using direct score API mode with current access token.');
     let currentRows;
-    try {
-      currentRows = await fetchScoreRowsFn(config);
-    } catch (error) {
-      if (error && error.code === 'BBGU_AUTH_EXPIRED') {
-        currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn });
-      } else {
-        throw error;
+    const localExpiry = extractJwtExpiry(config.authorization);
+    if (localExpiry && localExpiry.epochSeconds * 1000 <= nowFn()) {
+      console.log('[BBGU] Access token is locally known to be expired; skipping the avoidable score API request.');
+      currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn, nowFn });
+    } else {
+      try {
+        currentRows = await fetchScoreRowsFn(config);
+      } catch (error) {
+        if (error && error.code === 'BBGU_AUTH_EXPIRED') {
+          currentRows = await recoverDirectApiAfterAuthExpiredFn(config, { fetchScoreRowsFn, nowFn });
+        } else {
+          throw error;
+        }
       }
     }
     return finishGradeRun(currentRows);
@@ -2294,39 +2654,64 @@ async function run(config = getConfig(), deps = {}) {
   return finishGradeRun(currentRows);
 }
 
+async function run(config = getConfig(), deps = {}) {
+  const consumeWatchNetworkCooldownFn = deps.consumeWatchNetworkCooldownFn || consumeWatchNetworkCooldown;
+  const markWatchNetworkFailureFn = deps.markWatchNetworkFailureFn || markWatchNetworkFailure;
+  const markSchoolBackoffFn = deps.markSchoolBackoffFn || markSchoolBackoff;
+  if (await consumeWatchNetworkCooldownFn(config)) {
+    console.log('[BBGU] 当前处于网络或学校服务退避期，本次Watch不访问学校。');
+    return { status: 'network_cooldown_skipped' };
+  }
+  try {
+    return await runCore(config, deps);
+  } catch (error) {
+    if (error && ['BBGU_PROXY_FAILOVER_EXHAUSTED', 'BBGU_PROXY_NETWORK_FAILED'].includes(error.code)) {
+      await markWatchNetworkFailureFn(config);
+    } else if (error && (error.httpStatus === 429 || (error.httpStatus >= 500 && error.httpStatus <= 599))) {
+      await markSchoolBackoffFn(config, error);
+    }
+    throw error;
+  }
+}
+
 async function runLogin(config = getConfig(), options = {}) {
   if (!config.pushplusToken) {
     throw new Error('Missing PUSHPLUS_TOKEN. Set it in GitHub repository secrets.');
   }
 
-  return withBrowserContext(config, createContext, async (context) => {
+  const ignoreInitialAccessToken = Boolean(options.ignoreInitialAccessToken);
+  const loginContextFactory = ignoreInitialAccessToken
+    ? (browser, nextConfig) => createAccessRenewalContext(browser, nextConfig)
+    : createContext;
+  return withBrowserContext(config, loginContextFactory, async (context) => {
     const page = await context.newPage();
     installPageRequestFailureCapture(page);
     const weixinQrCapture = createWeixinQrCapture(page);
-    const ignoreInitialAccessToken = Boolean(options.ignoreInitialAccessToken);
     const onQrSent = typeof options.onQrSent === 'function'
       ? options.onQrSent
       : async () => undefined;
-    if (ignoreInitialAccessToken) {
-      const origin = new URL(config.homeUrl).origin;
-      await page.goto(`${origin}/sam/home`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => undefined);
-      await clearBrowserAccessTokens(page);
-      console.log('[BBGU] Cleared saved browser access token before login fallback.');
-    }
+    if (ignoreInitialAccessToken) console.log('[BBGU] Cleared saved browser access token locally before login fallback.');
     console.log(`[BBGU] Opening ${config.homeUrl} for login.`);
-    await navigateToLoginPage(page, config.homeUrl);
-    await page.waitForTimeout(3000);
-    if (/^chrome-error:\/\//i.test(page.url())) {
-      const diagnostic = await saveLoginTimeoutDiagnostics(page, config);
-      throw new Error(`BBGU login page failed to load in Chromium. Diagnostic report: ${diagnostic.reportPath}; screenshot: ${diagnostic.screenshotPath}`);
+    try {
+      await navigateToLoginPage(page, config.homeUrl, {
+        onNetworkFailureFn: async (error) => {
+          await recordCurrentProxyFailure(config, error);
+          error.code = 'BBGU_PROXY_NETWORK_FAILED';
+        },
+      });
+    } catch (error) {
+      if (error && (error.httpStatus === 429 || (error.httpStatus >= 500 && error.httpStatus <= 599))) {
+        await markSchoolBackoff(config, error);
+      }
+      throw error;
     }
+    await page.waitForTimeout(3000);
+    await handleChromeErrorPage(page, config);
 
-    let token = ignoreInitialAccessToken ? '' : (await extractAuthStateFromPage(page)).accessToken;
-    if (!token && !(await isAuthenticated(page))) {
+    if (await shouldStartQrLogin(page)) {
       const pageScreenshotPath = await saveScreenshot(page, config, 'qr-login');
-      const weixinQrInfo = await weixinQrCapture.wait(5000) || await fetchWeixinQrInfoFromPage(page);
+      const { weixinQrInfo, qrElementScreenshotPath } = await collectLoginQrArtifacts(page, config, weixinQrCapture);
       const qrImageUrl = weixinQrInfo?.qrImageUrl || '';
-      const qrElementScreenshotPath = await saveQrElementScreenshot(page, config);
       const screenshotPath = qrElementScreenshotPath || pageScreenshotPath;
       let textQr = '';
       const decodedQrPayload = await decodeQrPayloadFromPngFile(screenshotPath).catch((error) => {
@@ -2380,9 +2765,9 @@ async function runLogin(config = getConfig(), options = {}) {
     }
 
     weixinQrCapture.stop();
-    await saveBrowserAuthState(page, config);
-    await context.storageState({ path: config.storageStatePath });
-    await clearQrReminderState(config);
+    const authState = await saveBrowserAuthState(page, config);
+    await saveBrowserStorageState(context, config.storageStatePath);
+    await finalizeLoginReminderState(config, authState);
     console.log(`[BBGU] Access token saved: ${config.tokenPath}`);
     console.log(`[BBGU] Storage state saved: ${config.storageStatePath}`);
     return { status: 'login_ok', tokenPath: config.tokenPath };
@@ -2418,8 +2803,41 @@ async function maybeRunScheduledQr(config, deps = {}) {
   return result;
 }
 
-async function navigateToLoginPage(page, homeUrl) {
-  return page.goto(homeUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+async function validateBrowserHttpResponse(response) {
+  if (!response) return response;
+  const status = Number(typeof response.status === 'function' ? response.status() : response.status);
+  if (status !== 429 && !(status >= 500 && status <= 599)) return response;
+  const headers = typeof response.headers === 'function' ? await response.headers() : response.headers;
+  const url = typeof response.url === 'function' ? response.url() : response.url;
+  const error = new Error(`BBGU browser navigation failed: HTTP ${status}${url ? ` url=${url}` : ''}`);
+  error.httpStatus = status;
+  if (status === 429) error.retryAfter = responseHeader(headers, 'retry-after');
+  throw error;
+}
+
+async function handleChromeErrorPage(page, config, deps = {}) {
+  if (!/^chrome-error:\/\//i.test(page.url())) return false;
+  const recordCurrentProxyFailureFn = deps.recordCurrentProxyFailureFn || ((error) => recordCurrentProxyFailure(config, error));
+  const saveLoginTimeoutDiagnosticsFn = deps.saveLoginTimeoutDiagnosticsFn || saveLoginTimeoutDiagnostics;
+  const error = new Error('BBGU login page failed to load in Chromium.');
+  error.code = 'BBGU_PROXY_NETWORK_FAILED';
+  await recordCurrentProxyFailureFn(error);
+  const diagnostic = await saveLoginTimeoutDiagnosticsFn(page, config);
+  error.message = `BBGU login page failed to load in Chromium. Diagnostic report: ${diagnostic.reportPath}; screenshot: ${diagnostic.screenshotPath}`;
+  throw error;
+}
+
+async function navigateToLoginPage(page, homeUrl, deps = {}) {
+  try {
+    const response = await page.goto(homeUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await validateBrowserHttpResponse(response);
+    return response;
+  } catch (error) {
+    if (isNetworkTransportError(error) && typeof deps.onNetworkFailureFn === 'function') {
+      await deps.onNetworkFailureFn(error);
+    }
+    throw error;
+  }
 }
 
 async function runRenew(config = getConfig(), deps = {}) {
@@ -2445,6 +2863,10 @@ async function runRenew(config = getConfig(), deps = {}) {
     try {
       result = await runSilentRenewFn(config);
     } catch (casError) {
+      if (!casError || casError.code !== 'BBGU_CAS_EXPIRED') {
+        console.log(`[BBGU] CAS静默续期发生本地或网络故障，本次不判定Session失效。原因：${casError && (casError.message || casError)}`);
+        throw casError;
+      }
       await markCasExpiredFn(config);
       casStatus = 'expired';
       console.log(`[BBGU] CAS静默续期失败，后续改用Refresh Token续Access。原因：${casError.message || casError}`);
@@ -2531,6 +2953,7 @@ module.exports = {
   buildAuthorizationHeader,
   parseSavedAuthState,
   extractAuthStateFromStorageState,
+  sanitizeStorageStateForAccessRenewal,
   decodeJwtPayload,
   extractJwtExpiry,
   formatAuthStatusSummary,
@@ -2543,6 +2966,7 @@ module.exports = {
   mergePersistedSubScores,
   selectRowsForSubScoreFetch,
   enrichRowsWithSubScores,
+  processGradeRows,
   fetchBbguSubScores,
   diagnoseBbguSubscore,
   runSubscoreDiagnostic,
@@ -2567,28 +2991,47 @@ module.exports = {
   isAuthExpiredResponse,
   normalizeBbguScoreApiData,
   getConfig,
+  isNetworkTransportError,
+  isSafeCasFailoverError,
+  isSafeApiFailoverError,
+  selectStartupProxy,
+  saveSelectedProxy,
+  recordCurrentProxyFailure,
+  withSingleProxyFailover,
+  markWatchNetworkFailure,
+  markSchoolBackoff,
+  consumeWatchNetworkCooldown,
   readSavedAuthState,
   saveAuthState,
+  writeFileAtomic,
+  saveBrowserStorageState,
   readQrReminderState,
   saveQrReminderSchedule,
   markCasExpired,
   markRefreshExpired,
   clearQrReminderSchedule,
   clearQrReminderState,
+  readRefreshResponse,
   requestRefreshedAuthState,
   refreshAndSaveAuthState,
   extractWeixinQrInfoFromHtml,
-  extractWeixinQrConnectUrlFromHtml,
-  fetchWeixinQrInfoFromPage,
   extractAuthStateFromPage,
+  shouldStartQrLogin,
   saveBrowserAuthState,
+  finalizeLoginReminderState,
   clearBrowserAccessTokens,
+  validateBrowserHttpResponse,
+  handleChromeErrorPage,
   navigateToLoginPage,
+  waitForAuthenticationAfterQr,
+  waitForAuthState,
+  collectLoginQrArtifacts,
   createWeixinQrCapture,
   selectChromiumExecutable,
   findChromiumExecutable,
   launchChromium,
   runSilentRenew,
+  performSilentRenew,
   maybeRunScheduledQr,
   runRenew,
   recoverDirectApiAfterAuthExpired,

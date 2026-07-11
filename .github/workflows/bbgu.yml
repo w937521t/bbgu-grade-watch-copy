@@ -10,9 +10,9 @@ on:
         type: choice
         options: [watch, renew, login, watch-reset]
   schedule:
-    - cron: '0 10-22 * * *'
+    - cron: '7 10-22 * * *'
       timezone: Asia/Shanghai
-    - cron: '30 1-23/2 * * *'
+    - cron: '37 1-23/2 * * *'
       timezone: Asia/Shanghai
 
 permissions:
@@ -220,7 +220,7 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
             mode='${{ inputs.mode }}'
-          elif [[ "${{ github.event.schedule }}" == '30 1-23/2 * * *' ]]; then
+          elif [[ "${{ github.event.schedule }}" == '37 1-23/2 * * *' ]]; then
             mode='renew'
           else
             mode='watch'

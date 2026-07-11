@@ -8,8 +8,8 @@ const workflowPath = path.join(__dirname, '..', '.github', 'workflows', 'bbgu.ym
 test('Workflow保持GitHub定时并使用加密状态分支', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
 
-  assert.match(yaml, /cron: ['"]0 10-22 \* \* \*['"]/);
-  assert.match(yaml, /cron: ['"]30 1-23\/2 \* \* \*['"]/);
+  assert.match(yaml, /cron: ['"]7 10-22 \* \* \*['"]/);
+  assert.match(yaml, /cron: ['"]37 1-23\/2 \* \* \*['"]/);
   assert.equal((yaml.match(/timezone: Asia\/Shanghai/g) || []).length, 2);
   assert.match(yaml, /options: \[watch, renew, login, watch-reset\]/);
   assert.match(yaml, /cancel-in-progress: false/);
@@ -18,6 +18,7 @@ test('Workflow保持GitHub定时并使用加密状态分支', () => {
   assert.match(yaml, /bbgu-state\.enc/);
   assert.match(yaml, /bbgu_proxy_state\.json/);
   assert.match(yaml, /node bbgu_grade_watch\.js renew/);
+  assert.match(yaml, /github\.event\.schedule \}\}" == '37 1-23\/2 \* \* \*'/);
   assert.match(yaml, /node bbgu_grade_watch\.js login/);
   assert.match(yaml, /watch-reset\)\s+rm -f "\$BBGU_DATA_DIR\/bbgu_grade_snapshot\.json"/);
   assert.match(yaml, /echo '\[BBGU\] 已清空成绩快照，本次watch会把现有成绩视为新增。'/);

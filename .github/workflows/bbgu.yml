@@ -250,6 +250,22 @@ jobs:
             *) echo "未知模式：$mode" >&2; exit 2 ;;
           esac
 
+      - name: 一次性TLS诊断
+        if: steps.run_bbgu.outcome == 'failure'
+        run: |
+          curl \
+            --proxy http://127.0.0.1:7890 \
+            --noproxy "" \
+            --http1.1 \
+            --connect-timeout 15 \
+            --max-time 30 \
+            --verbose \
+            --output /dev/null \
+            "https://zhjw.bbgu.edu.cn/authserver/casLogin?redirect_uri=https%3A%2F%2Fzhjw.bbgu.edu.cn%2Fsam%2Fcas" \
+            2>&1 || true
+
+          docker logs --tail 200 bbgu-mihomo 2>&1 || true
+
       - name: 上传登录诊断
         if: steps.run_bbgu.outcome == 'failure'
         uses: actions/upload-artifact@v4

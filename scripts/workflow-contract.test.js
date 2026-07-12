@@ -11,7 +11,8 @@ test('Workflow保持GitHub定时并使用加密状态分支', () => {
   assert.match(yaml, /cron: ['"]7 10-22 \* \* \*['"]/);
   assert.match(yaml, /cron: ['"]37 1-23\/2 \* \* \*['"]/);
   assert.equal((yaml.match(/timezone: Asia\/Shanghai/g) || []).length, 2);
-  assert.match(yaml, /options: \[watch, renew, login, watch-reset, subscore-test\]/);
+  assert.match(yaml, /options: \[watch, renew, login, watch-reset\]/);
+  assert.doesNotMatch(yaml, /subscore-test/);
   assert.match(yaml, /cancel-in-progress: false/);
   assert.match(yaml, /PUSHPLUS_TOKEN: \$\{\{ secrets\.PUSHPLUS_TOKEN \}\}/);
   assert.match(yaml, /BBGU_STATE_PASSWORD: \$\{\{ secrets\.BBGU_STATE_PASSWORD \}\}/);
@@ -23,31 +24,11 @@ test('Workflow保持GitHub定时并使用加密状态分支', () => {
   assert.match(yaml, /node bbgu_grade_watch\.js renew/);
   assert.match(yaml, /github\.event\.schedule \}\}" == '37 1-23\/2 \* \* \*'/);
   assert.match(yaml, /node bbgu_grade_watch\.js login/);
-  assert.match(yaml, /subscore-test\) node bbgu_grade_watch\.js subscore-test ;;/);
   assert.match(yaml, /watch-reset\)\s+rm -f "\$BBGU_DATA_DIR\/bbgu_grade_snapshot\.json"/);
   assert.match(yaml, /echo '\[BBGU\] 已清空成绩快照，本次watch会把现有成绩视为新增。'/);
   assert.match(yaml, /node bbgu_grade_watch\.js\s+;;/);
   assert.doesNotMatch(yaml, /watch-reset[\s\S]*rm -f "\$BBGU_DATA_DIR\/bbgu_token\.env"/);
   assert.doesNotMatch(yaml, /watch-reset[\s\S]*rm -f "\$BBGU_DATA_DIR\/bbgu_storage_state\.json"/);
-});
-
-test('Workflow平时分诊断不改状态并输出Mihomo日志', () => {
-  const yaml = fs.readFileSync(workflowPath, 'utf8');
-  const stateStep = yaml.match(/- name: 加密并保存状态[\s\S]*?(?=\n      - name:|$)/)?.[0] || '';
-  const mihomoLogStep = yaml.match(/- name: Mihomo诊断日志[\s\S]*?(?=\n      - name:|$)/)?.[0] || '';
-  const diagnosticSelectionIndex = yaml.indexOf('if [[ "${BBGU_RUN_MODE:-}" == \'subscore-test\' ]]; then');
-  const normalSelectionIndex = yaml.indexOf('if [[ -n "$saved_proxy" ]]; then');
-  const diagnosticSelection = diagnosticSelectionIndex >= 0 && normalSelectionIndex > diagnosticSelectionIndex
-    ? yaml.slice(diagnosticSelectionIndex, normalSelectionIndex)
-    : '';
-
-  assert.match(yaml, /BBGU_RUN_MODE: \$\{\{ inputs\.mode \}\}/);
-  assert.match(diagnosticSelection, /set_group_proxy "\$saved_proxy"/);
-  assert.match(diagnosticSelection, /exit 0/);
-  assert.doesNotMatch(diagnosticSelection, /test_bbgu_proxy|save_sticky_proxy|while IFS=/);
-  assert.match(stateStep, /if: always\(\) && !\(github\.event_name == 'workflow_dispatch' && inputs\.mode == 'subscore-test'\)/);
-  assert.match(mihomoLogStep, /inputs\.mode == 'subscore-test'/);
-  assert.match(mihomoLogStep, /docker logs --tail 100 bbgu-mihomo/);
 });
 
 test('Workflow不持久化登录态明文', () => {

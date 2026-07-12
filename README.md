@@ -1,231 +1,529 @@
-# 北部湾大学成绩监控：GitHub Actions 部署
+# BBGU Grade Watch
 
-本方案用于 GitHub 私有仓库。成绩查询保持北京时间每天 10:07—22:07 执行，登录态续期保持全天奇数点 37 分执行。
+[![北部湾大学成绩监控](https://github.com/w937521t/bbgu-grade-watch/actions/workflows/bbgu.yml/badge.svg)](https://github.com/w937521t/bbgu-grade-watch/actions/workflows/bbgu.yml)
 
-## 一、创建私有仓库
+基于 GitHub Actions 的北部湾大学成绩监控脚本。它会定时维护登录状态、查询本学期成绩，并在成绩新增或变更时通过 PushPlus 发送通知。
 
-1. 在 GitHub 创建一个 Private repository。
-2. 将本目录作为仓库根目录上传，至少包含：
-   - `.github/workflows/bbgu.yml`
-   - `bbgu_grade_watch.js`
-   - `bbgu_grade_watch.test.js`
-   - `scripts/state-crypto.js`
-   - `scripts/state-crypto.test.js`
-   - `scripts/workflow-contract.test.js`
-   - `package.json`
-   - `package-lock.json`
-   - `.gitignore`
-3. 不要上传 Token、Cookie、`bbgu-data`、二维码图片或 Actions 运行状态文件。
+本项目只面向 GitHub Actions，不包含青龙、油猴或本地常驻运行方案。
 
-## 二、配置 Secrets
+> 仅用于查询本人账号和本人有权访问的数据。仓库必须设为 Private，不要公开 Token、Cookie、机场订阅或状态加密密码。
 
-进入仓库：
+## 功能
 
-`Settings → Secrets and variables → Actions → Secrets → New repository secret`
+- 每天北京时间 10:07 至 22:07，每小时查询一次成绩。
+- 每天奇数小时 01:37 至 23:37，每两小时维护一次登录状态。
+- 只有成绩新增或变更时才查询相关课程的平时分。
+- 没有成绩变化时不推送，也不查询平时分。
+- 通过 CAS、Refresh Token、Access Token 三层状态尽量延长免扫码时间。
+- 使用 Mihomo 国内粘性节点，节点正常时长期保持同一出口。
+- 登录状态、成绩快照和运行状态经 AES-256-GCM 加密后保存到独立 state 分支。
+- PushPlus 失败后保留待发送通知，下次任务继续发送，不重复查询平时分。
+- 临时网络故障只跳过本次脚本任务，不误判 CAS 或 Token 失效。
 
-添加三个 Repository Secret：
+## 快速部署
 
-### `PUSHPLUS_TOKEN`
+### 1. 创建私有仓库
 
-填写你的 PushPlus Token，用于成绩通知和扫码提醒。
+将本项目上传到 GitHub Private repository。仓库根目录至少需要：
 
-### `BBGU_STATE_PASSWORD`
+~~~text
+.github/workflows/bbgu.yml
+scripts/state-crypto.js
+scripts/state-crypto.test.js
+scripts/workflow-contract.test.js
+bbgu_grade_watch.js
+bbgu_grade_watch.test.js
+package.json
+package-lock.json
+.gitignore
+README.md
+~~~
 
-填写你自己生成的状态加密密码。它不是学校密码，也不是 GitHub 密码。建议使用至少 32 位随机字符。
+不要上传 bbgu-data、Token、Cookie、二维码截图或机场订阅。
 
-PowerShell 生成示例：
+### 2. 配置 Repository Secrets
 
-```powershell
+进入：
+
+~~~text
+Settings -> Secrets and variables -> Actions -> Secrets
+~~~
+
+添加：
+
+| Secret | 必填 | 用途 |
+| --- | --- | --- |
+| PUSHPLUS_TOKEN | 是 | 发送成绩通知和扫码提醒 |
+| BBGU_STATE_PASSWORD | 是 | 加密和解密 state 分支中的运行状态 |
+| CLASH_SUBSCRIPTION_URL | 是 | 在 GitHub Runner 中临时启动 Mihomo |
+| BBGU_PROXY_FILTER | 否 | 覆盖默认国内节点筛选正则 |
+| BBGU_PROXY_EXCLUDE | 否 | 覆盖默认境外节点排除正则 |
+
+BBGU_STATE_PASSWORD 不是学校密码。建议生成至少 32 位随机字符串，并单独保存：
+
+~~~powershell
 -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 40 | ForEach-Object {[char]$_})
-```
+~~~
 
-请自行保存该密码，不要提交到仓库、日志或截图中。
+默认国内节点筛选：
 
-### `CLASH_SUBSCRIPTION_URL`
-
-填写机场后台提供的 Clash 或 Mihomo 订阅链接。该链接本身相当于账号凭据：
-
-- 不要发送给他人。
-- 不要提交到仓库。
-- 不要放入普通 Variable。
-- 不要在截图中显示。
-
-Workflow 只会在临时 Runner 内使用此链接启动 Mihomo，任务结束后临时配置自动销毁。
-
-### 可选：`BBGU_PROXY_FILTER`
-
-默认只选择国内节点，匹配规则为：
-
-```text
+~~~text
 (?i)(^CN-|中国|国内|上海|深圳|浙江|内蒙古|云南|山东|河南|成都|广东)
-```
+~~~
 
-如果你的订阅节点命名不同，可以添加这个 Secret 覆盖默认规则。例如：
+默认境外节点排除：
 
-```text
-CN-|国内|中国|电信|移动|联通
-```
-
-### 可选：`BBGU_PROXY_EXCLUDE`
-
-默认排除境外和流媒体节点：
-
-```text
+~~~text
 (?i)(HK|香港|TW|台湾|JP|日本|US|美国|Netflix)
-```
+~~~
 
-Workflow 还会始终排除“剩余、流量、到期、官网、套餐”等订阅说明类节点。
+脚本还会排除名称中包含“剩余、流量、到期、官网、套餐”的订阅说明项。
 
-## 三、配置学期变量
+### 3. 配置学期变量
 
 进入：
 
-`Settings → Secrets and variables → Actions → Variables → New repository variable`
+~~~text
+Settings -> Secrets and variables -> Actions -> Variables
+~~~
 
-必须添加：
+添加：
 
-```text
+~~~text
 名称：BBGU_TERM
-值：2026春
-```
+示例值：2026春
+~~~
 
-新学期开始后只需修改这个变量。`watch` 缺少该变量时会在请求成绩前直接失败，避免把多个学期混在同一份快照中。脚本升级后会自动迁移旧快照的课程键，不会因此把已有成绩重新通知一遍。
+新学期开始时只需修改该变量。缺少 BBGU_TERM 时，watch 会在访问成绩接口前停止，防止不同学期混入同一快照。
 
-## 四、允许 Workflow 更新状态分支
+### 4. 开启 Workflow 写权限
 
 进入：
 
-`Settings → Actions → General → Workflow permissions`
+~~~text
+Settings -> Actions -> General -> Workflow permissions
+~~~
 
-选择：
+选择 Read and write permissions。该权限用于创建和更新加密状态分支。
 
-```text
-Read and write permissions
-```
+### 5. 首次扫码
 
-保存设置。Workflow 需要该权限创建和更新 `state` 分支。
-
-## 五、首次扫码登录
-
-1. 打开仓库的 `Actions` 页面。
+1. 打开仓库的 Actions 页面。
 2. 选择“北部湾大学成绩监控”。
-3. 点击 `Run workflow`。
-4. 模式选择 `login`。
-5. 点击运行。
-6. 收到 PushPlus 二维码后，在约 5 分钟内扫码。
-7. 等待 Workflow 完成。
+3. 点击 Run workflow。
+4. 模式选择 login。
+5. 收到 PushPlus 二维码后，在 300 秒内扫码。
+6. 等待任务完成。
 
-首次成功后，仓库会自动出现 `state` 分支，其中只有：
+成功后，仓库会出现 state 分支，其中只有：
 
-```text
+~~~text
 bbgu-state.enc
-```
+~~~
 
-这是 AES-256-GCM 加密后的登录状态，不是 Token 明文。`state` 分支每次更新都会替换为一个新的根提交，只保留最新状态；更新使用 `force-with-lease` 防止覆盖并发变化。远程状态读取失败时任务会停止，不会按“首次运行”继续并覆盖原状态。
+这是加密状态包，不是 Token 明文。
 
-## 六、手动验证
+### 6. 验证
 
-首次登录成功后，依次手动运行：
+首次登录后建议手动运行：
 
-1. `renew`：确认日志显示 CAS、Refresh Token、Access Token 状态。
-2. `watch`：确认能够查询成绩，并生成或更新成绩快照。
+1. renew：检查 CAS、Refresh Token、Access Token 状态。
+2. watch：确认能够查询成绩并保存快照。
 
-两次运行结束后都应看到加密状态成功推送到 `state` 分支。
+正常情况下，两次运行结束后都会更新加密状态。
 
-如需临时验证已出成绩是否能触发新增通知和平时分明细查询，可手动运行 `watch-reset`。该模式只删除本次 Runner 恢复出的 `bbgu_grade_snapshot.json`，不会删除 Token、Cookie 或浏览器登录态；随后按 `watch` 执行一次，并把现有成绩视为新增。
+## 整体运行流程
 
-成绩、平时分和 Refresh 接口统一通过系统 `curl --http1.1` 通信；配置 `BBGU_PROXY_SERVER` 时使用当前 Mihomo 粘性节点，否则由 curl 直连。Token 只通过 curl 标准输入传递，不出现在命令参数和日志中。正常情况下每个业务动作只产生一次学校 HTTP 请求；整次任务共用一次节点切换额度，不会让成绩、平时分和认证请求各自切换一次。
+~~~mermaid
+flowchart LR
+    A["GitHub 定时器"] --> B["恢复加密状态"]
+    B --> C["启动 Mihomo 粘性节点"]
+    C --> D{"运行模式"}
+    D -->|"watch"| E["查询总成绩"]
+    D -->|"renew"| F["维护登录状态"]
+    D -->|"login"| G["扫码登录"]
+    E --> H["对比成绩快照"]
+    H -->|"无变化"| I["不推送"]
+    H -->|"新增或变更"| J["查询相关课程平时分"]
+    J --> K["加入 PushPlus 队列并发送"]
+    F --> L["更新认证状态"]
+    G --> L
+    I --> M["加密并保存状态"]
+    K --> M
+    L --> M
+~~~
 
-请求前会先读取 Access Token 的 JWT `exp`。本地已经确定过期时，脚本直接进入 Refresh Token 或二维码恢复，不会先向成绩接口发送一次必然失败的旧 Token 请求。学校返回明确指向统一认证、CAS 或登录页的 HTTP 重定向时，也会进入同一恢复逻辑；其他重定向不会被误判为认证失效。
+每次 GitHub Actions 都运行在一台全新的临时 Ubuntu Runner 上，因此脚本必须在开始时恢复状态，在结束时重新保存状态。
 
-发现新增或变更成绩后，脚本会先查询本次涉及课程的平时分并把通知写入待推送队列，再保存成绩快照，最后发送 PushPlus。PushPlus 失败时，下次任务只重试已经保存的通知，不会再次查询平时分；快照首次写入失败时也会复用同一条待推送内容，避免重复查询和重复生成通知。
+## 四种运行模式
 
-## 七、定时规则
+| 模式 | 用途 | 是否查成绩 |
+| --- | --- | --- |
+| watch | 查询成绩、对比快照、必要时查询平时分并推送 | 是 |
+| renew | 维护 CAS、Refresh 和 Access，安排扫码时间 | 否 |
+| login | 首次登录或手动重新扫码 | 否 |
+| watch-reset | 删除旧快照，再执行一次 watch | 是 |
 
-成绩查询：
+watch-reset 会把当前所有成绩视为“新增”，因此会产生一次测试通知，并尝试查询这些课程的平时分。不要把它当作日常模式。
 
-```cron
-7 10-22 * * *
-```
+## 定时安排
 
-北京时间每天 `10:07、11:07……22:07` 执行。
+| 模式 | 北京时间 | 每日次数 |
+| --- | --- | ---: |
+| watch | 10:07、11:07……22:07 | 13 |
+| renew | 01:37、03:37……23:37 | 12 |
 
-登录态续期：
+GitHub Actions 的定时任务可能延迟。脚本依据 Token 的实际 JWT exp 和后续自动任务时间重新计算，不依赖任务绝对准点。
 
-```cron
-37 1-23/2 * * *
-```
+## 三层登录状态
 
-北京时间每天 `01:37、03:37……23:37` 执行。
+| 状态 | 保存位置 | 能做什么 | 失效后的结果 |
+| --- | --- | --- | --- |
+| CAS Session | bbgu_storage_state.json 中的 Cookie | 重新取得 Refresh 和 Access | 改用最后的 Refresh |
+| Refresh Token | bbgu_token.env | 向认证服务器申请新 Access | 继续使用最后的 Access |
+| Access Token | bbgu_token.env | 调用成绩和平时分接口 | 必须重新扫码 |
 
-GitHub Actions 的定时任务可能发生延迟；上述分钟数用于避开整点和半点的调度高峰，但仍不保证准点执行。
+关系可以简化为：
 
-## 八、什么时候需要重新扫码
+~~~text
+扫码登录
+  -> 得到 CAS Session
+  -> 得到 Refresh Token
+  -> 得到 Access Token
 
-不会每次扫码。每次运行都会从 `state` 分支恢复 CAS、Refresh Token 和 Access Token：
+CAS 有效
+  -> 静默续期
+  -> 重新取得 Refresh + Access
 
-- CAS 有效：静默续期，同时取得新的 Refresh Token（有效期 14 小时）和 Access Token（有效期 12 小时）。
-- CAS 失效后不会立刻或每次 `renew` 都使用 Refresh。只有当前 `watch` 已不能被 Access 覆盖，或已经到 Refresh 到期前最后一次安全机会且本次刷新确实能多覆盖至少一场 `watch` 时，才发送一次 Refresh 请求。未来任务距离 Refresh `exp` 不足 60 分钟时不再视为可靠机会，改由当前任务提前刷新，以容忍 GitHub Actions 排队延迟。
-- Refresh Token 的 JWT `exp` 始终先在本地解析；已经到达 `exp` 时直接同时标记 `refreshExpired` 和 `casExpired`，绝不再向学校发送必然失败的 Refresh POST 或 CAS 请求。
-- Watch 即使发现 Access 仍有效，也会本地检查已保存 Refresh 的 `exp`；Refresh 已到期时先写入 CAS 失效标记，再继续本次唯一的成绩查询，避免下一次 Renew 误请求 CAS。
-- CAS 和 Refresh Token 都失效：根据 Access Token 能否覆盖下一次成绩查询决定扫码时间。
-- 只有页面明确返回统一认证或扫码登录状态时才永久记录 CAS 失效；浏览器、本地文件、代理控制和状态保存错误只终止本次任务。
-- CAS 或扫码登录取得新 Access 但暂时没有新 Refresh 时，只会沿用尚未被接口明确判死的旧 Refresh；已记录失效的旧 Refresh 不会复活。
-- Refresh Token 一旦被接口明确判定失效，会写入加密状态；后续任务直接跳过无意义的重复刷新，直到 CAS 续期或扫码登录取得新状态。
-- Refresh Token 请求属于非幂等操作，最多只允许一次 POST 到达学校；收到响应、请求阶段断开或响应体异常时绝不重发。只有 curl 明确证明仍处于代理连接或目标 TLS 握手阶段、HTTP 尚未发送时，才允许切换一个节点继续完成这一次 POST。
-- 只有现有登录状态无法继续覆盖成绩查询时，才通过 PushPlus 推送二维码。
-- 自动 Renew 没有保存的 Access 时直接进入首次登录流程；如果二维码仍在两小时冷却期，则本次不重复打开登录页。
-- 二维码只有在 PushPlus 确认发送成功后才进入两小时冷却；发送前失败不会阻止下一次任务重试。
-- 扫码页只被动监听浏览器已经收到的微信响应，并尝试从页面二维码元素或截图解码；不会为补取二维码而主动请求 `combinedLogin.do` 或微信 `qrconnect` 页面。
-- 自动登录导航和扫码后都会先检查 localStorage；只要新 Access Token 已出现就不依赖首页文字及时刷新。Access 出现后最多额外等待 10 秒获取稍晚写入的新 Refresh Token；仍未出现时仅沿用未被判死的旧 Refresh，避免登录页面继续运行 30 秒。
-- 登录页打开后会立即检查已经被动捕获的微信响应和二维码元素；二维码已经存在时不会固定再等待 5 秒。只有两种来源都没有时才被动等待，期间不主动补请求二维码接口。
+CAS 失效
+  -> 使用最后的 Refresh 申请新 Access
 
-## 九、Mihomo代理规则
+Refresh 失效
+  -> 使用最后的 Access 完成它还能覆盖的 watch
 
-GitHub 托管 Runner 与教务系统之间的 TLS 链路不可用，因此 Workflow 会：
+Access 也无法覆盖下一次 watch
+  -> 推送二维码
+~~~
 
-1. 从 `CLASH_SUBSCRIPTION_URL` 临时加载机场节点。
-2. 默认只选择名称匹配 `CN-`、中国、国内或常见国内省市关键词的节点。
-3. 默认排除 HK、TW、JP、US、Netflix 等境外或流媒体节点。
-4. 启动时直接沿用上次粘性节点，不向学校主页、认证页、成绩接口或微信发送预检请求。
-5. 成绩和平时分 GET 只有在代理 TCP、CONNECT 或目标 TLS 阶段失败时，才允许整次任务最多切换一个国内候选节点。请求已经发出、响应已经开始或响应体中断后都不会跨 IP 重发，但当前节点仍会记入失败冷却。
-6. 发生网络失败的节点会进入 6 小时冷却。A、B 都失败时立即结束，不在同一任务遍历 C；下一次 `watch` 跳过一次，后续任务跳过仍在冷却的 A、B 并从 C 开始。Refresh POST 只有在 curl 明确停在 HTTP 发送前时才允许使用本次唯一的节点切换额度；二维码登录导航发生网络失败时只记录当前节点，不在本次重发。成功节点继续作为粘性节点使用。
-7. 让 Playwright、成绩接口和 Token 刷新请求通过本地 Mihomo 代理。
+脚本会解析 Access 和 Refresh 的 JWT exp。Refresh 的寿命不在代码中写死，以学校签发的实际 exp 为准；新 Access 的覆盖预测按 12 小时计算。
 
-GitHub状态提交和PushPlus保持直连。Workflow不会关闭HTTPS证书验证，也不会安装机场提供的CA。机场可以看到访问目标和流量元数据，但在正常TLS连接下不能读取Token或Cookie内容。
+Refresh 接口如果返回新的 Refresh，脚本会保存新值；如果没有返回，则保留原 Refresh。脚本不会假设 Refresh 一定能够刷新自己。
 
-成绩接口和 PushPlus 请求最长等待 30 秒。扫码流程等待浏览器被动捕获微信二维码信息，不再发起二维码辅助请求。Mihomo 使用固定镜像摘要，避免上游 `Alpha` 标签变化导致脚本在没有代码更新时突然改变行为。
+CAS 没有可直接读取的 JWT 到期时间。只有浏览器明确落到统一认证登录页时，脚本才记录 casExpired。普通超时、TLS 失败或断线不会把 CAS 判死。
 
-如果粘性节点和本次唯一候选节点都发生网络错误，任务会失败并保存一次 Watch 冷却状态。HTTP 业务响应不会触发节点切换：普通 `400/403` 直接报错；`429` 按 `Retry-After` 建立全局退避（缺失或无效时默认两小时）；`500/503` 建立一小时全局退避。退避期间自动 `watch`、`renew` 和二维码登录都不会访问学校。`502/504` 只终止当前任务，不切换节点、不重试，也不写跨任务退避状态。
+## watch：成绩查询逻辑
 
-CAS 静默续期只打开一次 CAS 续期地址；字体、图片、媒体和样式表资源不会加载，检测到新 Token 后立即保存。浏览器 storage state 仅用于保留 CAS Cookie，所有 BBGU Access、Refresh 和 Token 过期字段都会在落盘前删除。
+watch 的执行顺序如下：
 
-`bbgu_token.env` 是 Access Token 和 Refresh Token 的唯一可信来源。脚本不会从浏览器 storage state 迁移或复活旧 Refresh Token。
+1. 检查 PUSHPLUS_TOKEN 和 BBGU_TERM。
+2. 从加密状态中读取 Access Token。
+3. 解析 Access 的本地 exp。
+4. Access 未过期时，只请求一次总成绩接口。
+5. Access 已过期时，跳过这次必然失败的成绩请求，直接进入认证恢复。
+6. 如果服务器提前返回 401 或登录页，也进入认证恢复。
+7. 规范化课程名称、课程代码、成绩、学分、学期和 scoreId。
+8. 与 bbgu_grade_snapshot.json 对比。
+9. 只有新增或变更课程才查询平时分。
+10. 保存通知、成绩快照并发送 PushPlus。
 
-学校请求预算固定如下：
+总成绩接口：
 
-- 正常 `watch`：总成绩接口一次；没有新增或变更时平时分接口零次。
-- 有新增或变更：每门相关课程的平时分接口最多一次。
-- 第一门平时分出现 `401`、`429`、任意 `5xx`、网络中断或响应半包时，立即停止后续课程；不会因此重查总成绩。
-- CAS 静默续期：一次导航；Refresh：单次任务最多一次 POST；服务端提前返回认证 `401` 时，最多一次 Refresh 和一次总成绩重试。
-- 已到达学校的失败不会跨 IP 重发；只有可证明请求尚未到达学校的连接阶段错误，整次任务才允许切换一个国内节点。
+~~~text
+GET /api/sam/score/student/score
+~~~
 
-Token、成绩快照、待推送通知、二维码状态、节点状态和浏览器 storage state 都先写入同目录临时文件，再原子替换正式文件。Runner 中断时旧状态仍保持完整，避免损坏快照导致后续任务反复查询学校接口。
+课程唯一键包含学期、课程代码和课程名称，避免重修或跨学期课程互相覆盖。
 
-## 十、密码或状态损坏后的恢复
+### 成绩变化的定义
 
-如果 `BBGU_STATE_PASSWORD` 丢失或被更换，旧状态无法解密。处理方法：
+- 本次课程唯一键在旧快照中不存在：新增。
+- 同一课程唯一键仍存在，但成绩或学分等展示内容不同：变更。
+- 完全一致：无变化。
 
-1. 删除远端 `state` 分支。
-2. 在 Secrets 中设置新的 `BBGU_STATE_PASSWORD`。
-3. 手动运行 `login` 并重新扫码。
+没有变化时不查询平时分、不生成新通知，但仍会保存最新快照，并补发以前发送失败的通知。
 
-如果状态包损坏或密码错误，Workflow 会在恢复阶段直接失败，不会带着空状态覆盖原来的 `state` 分支。
+### 平时分查询
 
-## 安全规则
+平时分接口：
+
+~~~text
+GET /api/sam/scoreManage/stu-score-form?scoreId=...
+~~~
+
+规则：
+
+- 只查询本次新增或变更的课程。
+- 每门相关课程最多请求一次。
+- 没有 scoreId 时跳过并记录可用字段。
+- 课程自身没有明细时，继续查询下一门。
+- 发生认证、权限、限流、服务器、协议或全局网络错误时，停止查询后续课程。
+- 已经保存的平时分会合并回新快照，后续无变化时不会重复查询。
+
+## renew：登录续期逻辑
+
+renew 不查询成绩，只维护登录能力。
+
+### 第一阶段：CAS 静默续期
+
+CAS 尚未记录失效时：
+
+1. 读取保存的浏览器 Cookie。
+2. 从浏览器 localStorage 副本中删除旧 Access、Refresh 和 Token 过期字段。
+3. 保留 CAS Cookie。
+4. 打开一次 CAS 续期地址。
+5. 拦截图片、字体、媒体和样式表，减少无关资源请求。
+6. 等待页面写入新的 Access 和 Refresh。
+7. 原子保存 Token 和新的浏览器状态。
+
+结果处理：
+
+- 明确进入统一认证登录页：CAS 永久标记失效。
+- 临时网络或浏览器故障：本次结束，不标记 CAS 失效。
+- CAS 成功：清理旧二维码和失效标记，本次 renew 结束。
+
+### 第二阶段：Refresh 最后覆盖
+
+CAS 已确认失效后，脚本不会每次 renew 都调用 Refresh。
+
+它会结合当前 Access 的 exp、Refresh 的 exp、未来 watch 和 renew 时间、Refresh 到期前 60 分钟安全余量，以及新 Access 能覆盖的 watch 进行计算。
+
+只有以下情况才使用 Refresh：
+
+- 当前 watch 已经不被 Access 覆盖。
+- 当前任务是最后一个仍有价值的刷新机会，而且刷新后能够覆盖更多 watch。
+
+如果后面仍有安全的自动任务机会，当前 renew 会等待。这样尽量晚用最后的 Refresh，把最后一个 Access 的到期时间向后推。
+
+每次任务最多发送一次 Refresh POST，不对同一次失败重复提交。
+
+### 第三阶段：二维码计划
+
+当 Refresh 到达 JWT exp，或认证服务器明确返回 401、invalid_grant、invalid_token、已过期、已撤销等信息时，脚本将其永久标记为失效。
+
+随后根据最后一枚 Access 的到期时间，寻找第一场无法覆盖的 watch：
+
+- 普通时段：提前约 1 小时安排二维码。
+- 下一场是当天 10:07：安排在 09:37。
+- 09:37 已提醒但未扫码：允许 10:07 再提醒一次。
+- 其他重复提醒遵守 2 小时冷却。
+
+二维码只有在 PushPlus 明确发送成功后才写入冷却时间。发送前失败不会阻止下一次任务重试。
+
+## login：扫码逻辑
+
+login 会：
+
+1. 启动无头 Chromium。
+2. 通过 Mihomo 打开教务系统主页。
+3. 如果保存的 CAS 仍能自动登录，直接取得新 Token。
+4. 否则被动捕获页面已有的微信二维码。
+5. 优先截图二维码元素并尝试解码为终端文本二维码。
+6. 通过 PushPlus 发送扫码提醒。
+7. 最多等待 300 秒。
+8. 每 5 秒检查一次 Access 是否已经写入。
+9. Access 出现后最多额外等待 10 秒获取稍晚写入的 Refresh。
+10. 保存 Token、Cookie 和提醒状态。
+
+脚本不会为了补取二维码主动调用 combinedLogin.do 或微信 qrconnect。GitHub 环境下如果无法取得可扫码内容，会立即结束并上传短期诊断，而不是空等 300 秒。
+
+## 最小化学校请求
+
+| 场景 | 学校侧主要请求 |
+| --- | --- |
+| 正常 watch，无变化 | 1 次总成绩 GET，0 次平时分 |
+| watch 新增或变更 N 门 | 1 次总成绩 GET，最多 N 次平时分 GET |
+| Access 本地过期、Refresh 成功 | 1 次 Refresh POST，1 次总成绩 GET |
+| CAS 静默续期 | 1 次浏览器导航，并拦截非必要静态资源 |
+| Refresh 续 Access | 单次任务最多 1 次 POST |
+| 代理连接阶段失败 | 整个任务最多更换 1 个节点并重试一次 |
+| 已进入学校响应阶段后失败 | 不跨 IP 重发 |
+
+额外约束：
+
+- Workflow 启动代理时不访问学校做预检。
+- BBGU API 统一使用 curl 的 HTTP/1.1 模式。
+- curl 自动重试次数为 0。
+- Token 通过 curl 标准输入配置传递，不出现在命令行参数中。
+- PushPlus、GitHub API 和本地 Mihomo 控制器保持直连。
+
+## Mihomo 粘性节点
+
+代理目标是“长期使用一个节点，确认连接阶段失败后才换一个”。
+
+启动时优先读取上次保存的节点。该节点仍在订阅中且不在失败冷却期时继续使用，否则选择第一个可用国内候选节点。启动后不向学校发送健康检查。
+
+运行规则：
+
+- 只有代理 TCP、CONNECT 或目标 TLS 阶段失败，才允许换节点。
+- 单次任务最多从 A 换到 B，不继续遍历 C、D。
+- B 成功后保存 B，下一次继续使用 B。
+- A 或 B 连接失败后进入 6 小时冷却。
+- HTTP 业务响应不会触发节点切换。
+- 请求已经到达学校、响应已经开始或响应体中断后，不跨 IP 重发。
+
+Mihomo 镜像固定到摘要，避免上游 Alpha 标签变化导致运行行为突然改变。TLS 证书验证保持开启，不安装机场提供的 CA。
+
+## 学校退避
+
+| HTTP 状态 | 处理 |
+| --- | --- |
+| 429 | 按 Retry-After 退避；缺失或无效时默认 2 小时 |
+| 500 | 全局退避 1 小时 |
+| 503 | 全局退避 1 小时 |
+| 502/504 | 只结束当前任务，不写跨任务退避 |
+
+退避期间，自动 watch、renew 和二维码登录都不会访问学校。
+
+Node 脚本阶段的超时、连接关闭、TLS 握手失败等临时网络故障会以“本次任务正常跳过”结束，不会把 GitHub Actions 标记为脚本逻辑失败。代理容器无法启动、订阅无节点等 Workflow 准备阶段错误仍会正常标红。
+
+## 成绩通知可靠性
+
+发生成绩变化时，顺序是：
+
+1. 查询必要的平时分。
+2. 将完整通知写入 bbgu_pending_notification.json。
+3. 原子保存成绩快照。
+4. 调用 PushPlus。
+5. PushPlus 成功后删除待发送通知。
+
+这样可以保证 PushPlus 暂时失败时不丢通知，下次运行继续发送，并且不会重复查询平时分。相同成绩变化还会通过通知 ID 去重。
+
+## 状态文件
+
+| 文件 | 内容 |
+| --- | --- |
+| bbgu_token.env | Access Token 和 Refresh Token |
+| bbgu_storage_state.json | CAS Cookie；落盘前删除 BBGU Token localStorage 项 |
+| bbgu_grade_snapshot.json | 上次成绩和平时分记录 |
+| bbgu_pending_notification.json | 等待补发的 PushPlus 通知 |
+| bbgu_qr_reminder_state.json | CAS、Refresh 失效标记和二维码计划 |
+| bbgu_proxy_state.json | 粘性节点和失败冷却 |
+| bbgu_network_state.json | 学校退避状态 |
+
+所有 JSON 和 Token 文件都通过“临时文件写入后原子重命名”更新。写入中断时保留旧文件，避免损坏状态。
+
+## 加密状态分支
+
+任务结束时，Workflow 会：
+
+1. 将存在的状态文件打包为 tar.gz。
+2. 使用 BBGU_STATE_PASSWORD 通过 scrypt 派生 256 位密钥。
+3. 使用 AES-256-GCM 加密。
+4. 将结果保存为 bbgu-state.enc。
+5. 用新的孤立根提交替换远端 state 分支。
+
+state 分支不保存明文 Token，也不保留历史明文文件。更新使用 force-with-lease；如果任务运行期间远端状态已经变化，本次提交会停止，防止覆盖新状态。
+
+Workflow 的并发组还会保证同一仓库的登录状态任务依次执行，不会主动取消前一个任务。
+
+## 常见日志
+
+### No grade changes
+
+本次成绩与快照一致。不会推送，也不会查询平时分。
+
+### Access token is locally known to be expired
+
+脚本从 JWT exp 确认 Access 已过期，因此跳过一次必然失败的成绩请求，直接尝试认证恢复。
+
+### Access token expired; trying refresh token first
+
+Access 无法覆盖当前成绩查询，Refresh 仍有效，正在申请新 Access。
+
+### CAS：已失效，本次已跳过
+
+以前的任务已经明确进入统一认证登录页，因此后续任务不再重复访问 CAS。
+
+### Refresh Token 已记录失效，本次跳过续期请求
+
+Refresh 已到 exp，或认证服务器明确判定其失效。脚本不会重复发送无效 Refresh。
+
+### 二维码仍在冷却期
+
+扫码提醒已经发送过，当前未达到再次提醒时间。不是脚本卡住。
+
+### 当前处于学校服务退避期
+
+学校此前返回 429、500 或 503，本次任务主动不访问学校。
+
+### 本次任务因临时网络故障正常结束
+
+代理线路、TLS 或网络临时失败。本次不查询，下一次自动任务照常运行。
+
+### Subscore skipped：missing scoreId
+
+总成绩返回的数据中没有平时分接口所需的 scoreId。总成绩仍会正常保存和通知。
+
+### Subscore fetch failed
+
+总成绩已经取得，但该课程平时分查询失败。全局错误会停止后续平时分请求，减少额外访问。
+
+## 状态损坏或密码丢失
+
+BBGU_STATE_PASSWORD 丢失或更换后，旧状态无法解密。
+
+恢复方法：
+
+1. 删除远端 state 分支。
+2. 设置新的 BBGU_STATE_PASSWORD。
+3. 手动运行 login。
+4. 重新扫码。
+
+状态包损坏或密码错误时，Workflow 会在恢复阶段停止，不会用空状态覆盖原 state 分支。
+
+## 新学期
+
+1. 将仓库 Variable BBGU_TERM 改为新学期，例如 2026秋。
+2. 手动运行一次 watch。
+3. 如果需要把当前成绩全部作为测试新增，手动运行 watch-reset。
+
+课程键包含学期，旧学期和新学期不会互相覆盖。
+
+## 本地测试
+
+需要 Node.js 24：
+
+~~~bash
+npm ci
+npm test
+~~~
+
+测试覆盖状态机、Token 到期时间、二维码计划、代理切换、学校退避、成绩差异、平时分熔断、通知补发、状态加密和 Workflow 合同。
+
+## 项目结构
+
+~~~text
+.
+├── .github/workflows/bbgu.yml
+├── bbgu_grade_watch.js
+├── bbgu_grade_watch.test.js
+├── scripts
+│   ├── state-crypto.js
+│   ├── state-crypto.test.js
+│   └── workflow-contract.test.js
+├── package.json
+├── package-lock.json
+├── .gitignore
+└── README.md
+~~~
+
+## 安全要求
 
 - 仓库必须保持 Private。
-- 不要把 `bbgu_token.env`、`bbgu_storage_state.json`、Access Token、Refresh Token 或 CAS Cookie 提交到 Git。
-- 不要把运行状态上传为 Artifact 或放入 Actions Cache。
-- 不要在日志中打印 Secrets。
-- `state` 分支只允许存在 `bbgu-state.enc`。
+- 不要提交 bbgu-data、Token、Cookie、二维码或机场订阅。
+- 不要把运行状态放入 Artifact 或 Actions Cache。
+- 不要在日志、Issues、截图或聊天中公开 Secret。
+- state 分支应只包含 bbgu-state.enc。
+- 机场订阅链接本身属于敏感凭据。
+- 只查询本人账号和本人有权访问的数据。
+
+## 限制
+
+- GitHub Actions 定时任务不保证绝对准点。
+- 查询成功依赖学校服务、认证服务、机场线路和 PushPlus。
+- 学校前端或接口结构变化后，脚本可能需要更新。
+- 本项目尽量减少学校请求和重复请求，但不能保证外部服务永远稳定。
+
+## 免责声明
+
+本项目仅用于个人学习和本人信息提醒。使用者应遵守学校系统规则、GitHub 服务条款及当地法律法规，并自行承担账号、网络和通知服务相关风险。

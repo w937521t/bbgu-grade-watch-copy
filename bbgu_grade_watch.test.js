@@ -85,6 +85,7 @@ const {
   persistBrowserLoginState,
   validateBrowserHttpResponse,
   handleChromeErrorPage,
+  handleTaskError,
 } = bbguGradeWatch;
 
 test('curl单次传输通过标准输入隐藏Token并解析响应', async () => {
@@ -896,6 +897,23 @@ test('成绩请求只在到达学校前的网络阶段切换节点', () => {
   assert.equal(isNetworkTransportError(Object.assign(new Error('response incomplete'), { stage: 'response-body', code: 'ERR_HTTP_RESPONSE_INCOMPLETE' })), true);
   assert.equal(isNetworkTransportError(new Error('Proxy refresh CONNECT timeout after 15000ms')), true);
   assert.equal(isNetworkTransportError(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })), true);
+});
+
+test('临时网络故障正常结束任务而明确错误仍然失败', () => {
+  const logs = [];
+  const errors = [];
+  assert.equal(handleTaskError(
+    Object.assign(new Error('net::ERR_CONNECTION_CLOSED'), { code: 'BBGU_PROXY_NETWORK_FAILED' }),
+    { logFn: (message) => logs.push(message), errorFn: (message) => errors.push(message) }
+  ), false);
+  assert.match(logs[0], /正常结束/);
+  assert.deepEqual(errors, []);
+
+  assert.equal(handleTaskError(new Error('脚本逻辑错误'), {
+    logFn: () => undefined,
+    errorFn: (message) => errors.push(message),
+  }), true);
+  assert.deepEqual(errors, ['[BBGU] Script failed:']);
 });
 
 test('Watch双节点失败只结束本次任务且下一次Watch继续执行', async () => {

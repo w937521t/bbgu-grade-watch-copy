@@ -2953,6 +2953,17 @@ async function runRenew(config = getConfig(), deps = {}) {
   }
 }
 
+function handleTaskError(error, deps = {}) {
+  if (isNetworkTransportError(error)) {
+    const logFn = deps.logFn || console.log;
+    logFn(`[BBGU] 本次任务因临时网络故障正常结束，不判定脚本失败。原因：${error && (error.message || error)}`);
+    return false;
+  }
+  const errorFn = deps.errorFn || console.error;
+  errorFn('[BBGU] Script failed:', error && error.stack ? error.stack : util.inspect(error));
+  return true;
+}
+
 if (require.main === module) {
   const mode = process.argv[2] || 'run';
   const entry = mode === 'login'
@@ -2961,8 +2972,7 @@ if (require.main === module) {
       ? runRenew
       : run;
   entry().catch((error) => {
-    console.error('[BBGU] Script failed:', error && error.stack ? error.stack : util.inspect(error));
-    process.exitCode = 1;
+    if (handleTaskError(error)) process.exitCode = 1;
   });
 }
 
@@ -3048,6 +3058,7 @@ module.exports = {
   performSilentRenew,
   maybeRunScheduledQr,
   runRenew,
+  handleTaskError,
   recoverDirectApiAfterAuthExpired,
   fetchBbguScoreRows,
   requestWithCurl,

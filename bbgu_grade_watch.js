@@ -1431,11 +1431,6 @@ async function withSingleProxyFailover(config, operation, deps = {}) {
   }
 }
 
-async function markWatchNetworkFailure(config, nowMs = Date.now()) {
-  if (!config.networkStatePath) return;
-  await writeJson(config.networkStatePath, { skipNextWatch: true, failedAt: nowMs });
-}
-
 function retryAfterDeadline(value, nowMs) {
   const text = clean(value);
   if (/^\d+$/.test(text)) return nowMs + Number(text) * 1000;
@@ -1467,7 +1462,11 @@ async function consumeSchoolBackoff(config, nowMs = Date.now(), deps = {}) {
   const writeJsonFn = deps.writeJsonFn || writeJson;
   const rmFn = deps.rmFn || fsp.rm;
   const state = await readJsonFn(config.networkStatePath, null);
-  if (!state || !Number.isFinite(state.schoolBackoffUntil)) return false;
+  if (!state) return false;
+  if (!Number.isFinite(state.schoolBackoffUntil)) {
+    await rmFn(config.networkStatePath, { force: true });
+    return false;
+  }
   if (nowMs < state.schoolBackoffUntil) return true;
   delete state.schoolBackoffUntil;
   delete state.schoolBackoffStatus;
@@ -1476,18 +1475,6 @@ async function consumeSchoolBackoff(config, nowMs = Date.now(), deps = {}) {
   } else {
     await rmFn(config.networkStatePath, { force: true });
   }
-  return false;
-}
-
-async function consumeWatchNetworkCooldown(config, nowMs = Date.now()) {
-  if (!config.networkStatePath) return false;
-  const state = await readJson(config.networkStatePath, null);
-  if (!state) return false;
-  if (state.skipNextWatch) {
-    await fsp.rm(config.networkStatePath, { force: true });
-    return true;
-  }
-  await fsp.rm(config.networkStatePath, { force: true });
   return false;
 }
 
@@ -2558,24 +2545,16 @@ async function runCore(config = getConfig(), deps = {}) {
 
 async function run(config = getConfig(), deps = {}) {
   const consumeSchoolBackoffFn = deps.consumeSchoolBackoffFn || consumeSchoolBackoff;
-  const consumeWatchNetworkCooldownFn = deps.consumeWatchNetworkCooldownFn || consumeWatchNetworkCooldown;
-  const markWatchNetworkFailureFn = deps.markWatchNetworkFailureFn || markWatchNetworkFailure;
   const markSchoolBackoffFn = deps.markSchoolBackoffFn || markSchoolBackoff;
   const runCoreFn = deps.runCoreFn || runCore;
   if (await consumeSchoolBackoffFn(config)) {
     console.log('[BBGU] 当前处于学校服务退避期，本次Watch不访问学校。');
     return { status: 'school_backoff_skipped' };
   }
-  if (await consumeWatchNetworkCooldownFn(config)) {
-    console.log('[BBGU] 当前处于网络或学校服务退避期，本次Watch不访问学校。');
-    return { status: 'network_cooldown_skipped' };
-  }
   try {
     return await runCoreFn(config, deps);
   } catch (error) {
-    if (error && ['BBGU_PROXY_FAILOVER_EXHAUSTED', 'BBGU_PROXY_NETWORK_FAILED'].includes(error.code)) {
-      await markWatchNetworkFailureFn(config);
-    } else if (error && [429, 500, 503].includes(Number(error.httpStatus))) {
+    if (error && [429, 500, 503].includes(Number(error.httpStatus))) {
       await markSchoolBackoffFn(config, error);
     }
     throw error;
@@ -3037,10 +3016,8 @@ module.exports = {
   saveSelectedProxy,
   recordCurrentProxyFailure,
   withSingleProxyFailover,
-  markWatchNetworkFailure,
   markSchoolBackoff,
   consumeSchoolBackoff,
-  consumeWatchNetworkCooldown,
   readSavedAuthState,
   saveAuthState,
   writeFileAtomic,

@@ -153,17 +153,9 @@ test('Workflow不预检学校端点并在主任务失败时输出Mihomo日志', 
   assert.match(yaml, /docker logs --tail 100 bbgu-mihomo/);
 });
 
-test('Workflow只在任务失败后做一次TLS诊断，不预检学校', () => {
+test('Workflow不通过curl或健康检查访问学校', () => {
   const yaml = fs.readFileSync(workflowPath, 'utf8');
-  const diagnosticStep = yaml.match(/- name: 一次性TLS诊断[\s\S]*?(?=\n      - name:|$)/)?.[0] || '';
-  assert.match(diagnosticStep, /if: steps\.run_bbgu\.outcome == 'failure'/);
-  assert.match(diagnosticStep, /--proxy http:\/\/127\.0\.0\.1:7890/);
-  assert.match(diagnosticStep, /--max-time 30/);
-  assert.match(diagnosticStep, /--verbose/);
-  assert.doesNotMatch(diagnosticStep, /--retry|retry\s*=/i);
-  assert.doesNotMatch(diagnosticStep, /Authorization|PUSHPLUS_TOKEN|BBGU_ACCESS_TOKEN|BBGU_REFRESH_TOKEN/i);
-  const beforeTask = yaml.slice(0, yaml.indexOf('      - name: 执行BBGU任务'));
-  assert.doesNotMatch(beforeTask, /curl[^\n]*(?:zhjw|authserver)\.bbgu\.edu\.cn/i);
+  assert.doesNotMatch(yaml, /curl[^\n]*(?:zhjw|authserver)\.bbgu\.edu\.cn/i);
   assert.doesNotMatch(yaml, /health-check:[\s\S]*?bbgu\.edu\.cn/i);
   assert.doesNotMatch(yaml, /必要端点|测试候选节点/);
 });

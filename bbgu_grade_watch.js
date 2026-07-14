@@ -11,6 +11,7 @@ const util = require('node:util');
 
 const DEFAULT_HOME_URL = 'https://zhjw.bbgu.edu.cn/workspace/home';
 const PUSHPLUS_SEND_URL = 'https://www.pushplus.plus/send';
+const PUSHPLUS_WATERMARK = '关注北部湾大学吧谢谢喵 by zzzlzy';
 const BBGU_SCORE_API_URL = 'https://zhjw.bbgu.edu.cn/api/sam/score/student/score';
 const BBGU_SUBSCORE_API_PATH = '/api/sam/scoreManage/stu-score-form';
 const BBGU_BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145 Safari/537.36 Edg/145';
@@ -892,6 +893,11 @@ function formatPushPlusGradeTextContent({ maxChars = PUSHPLUS_CONTENT_MAX_CHARS,
   return `${fenceStart}${rawText}${fenceEnd}`;
 }
 
+function appendPushPlusWatermark(content) {
+  const text = String(content ?? '');
+  return text ? `${text}\n\n${PUSHPLUS_WATERMARK}` : PUSHPLUS_WATERMARK;
+}
+
 function extractWeixinQrInfoFromHtml(html) {
   const text = String(html || '');
   const uuid = clean(
@@ -1164,7 +1170,7 @@ async function sendPushPlus({
       body: JSON.stringify({
         token,
         title,
-        content,
+        content: appendPushPlusWatermark(content),
         template: 'markdown',
       }),
     },

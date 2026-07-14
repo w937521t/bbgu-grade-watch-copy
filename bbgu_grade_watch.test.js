@@ -714,7 +714,7 @@ test('sendPushPlus sends markdown template messages', async () => {
     const body = JSON.parse(calls[0].options.body);
     assert.equal(calls[0].url, 'https://www.pushplus.plus/send');
     assert.equal(body.template, 'markdown');
-    assert.equal(body.content, '<div>ok</div>');
+    assert.equal(body.content, '<div>ok</div>\n\n关注北部湾大学吧谢谢喵 by zzzlzy');
   } finally {
     global.fetch = originalFetch;
   }
